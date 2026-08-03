@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
 import {
   parseCommentEvents,
   parseMessageEvents,
@@ -12,6 +12,11 @@ import { MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from "@/lib/queue/client";
 import { Prisma } from "@/app/generated/prisma/client";
 
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
+
+// Anyone on the internet can POST here with a bad signature, so the failure
+// audit trail is throttled to one row per window instead of one per request.
+const SIGNATURE_FAILURE_THROTTLE_KEY = "webhook:sigfail:seen";
+const SIGNATURE_FAILURE_THROTTLE_SECONDS = 300;
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
@@ -36,21 +41,41 @@ export async function POST(request: NextRequest) {
   if (!verifyWebhookSignature(rawBody, signature)) {
     // Record the attempt so a signature mismatch is visible rather than a
     // silent 401. This is the common symptom of FACEBOOK_APP_SECRET being
-    // set to the wrong app's secret for the webhook's signing key.
-    await prisma.operationalEvent
-      .create({
-        data: {
-          source: "SYSTEM",
-          level: "WARNING",
-          message: "Webhook signature verification failed",
-          payload: {
-            hadSignatureHeader: Boolean(signature),
-            bodyLength: rawBody.length,
-            bodyPreview: rawBody.slice(0, 200),
+    // set to the wrong app's secret for the webhook's signing key. One row
+    // per window is enough to spot that; one row per request would let a
+    // curl loop fill the database. The body itself is never persisted — it
+    // is unverified attacker input that gets replayed into the diagnostics
+    // screen.
+    let shouldRecord = false;
+    try {
+      shouldRecord =
+        (await getRedisConnection().set(
+          SIGNATURE_FAILURE_THROTTLE_KEY,
+          "1",
+          "EX",
+          SIGNATURE_FAILURE_THROTTLE_SECONDS,
+          "NX"
+        )) === "OK";
+    } catch {
+      // Redis unreachable: drop the audit row rather than the 401.
+    }
+
+    if (shouldRecord) {
+      await prisma.operationalEvent
+        .create({
+          data: {
+            source: "SYSTEM",
+            level: "WARNING",
+            message: "Webhook signature verification failed",
+            payload: {
+              hadSignatureHeader: Boolean(signature),
+              bodyLength: rawBody.length,
+            },
           },
-        },
-      })
-      .catch(() => {});
+        })
+        .catch(() => {});
+    }
+
     return NextResponse.json(
       { success: false, error: "Invalid signature" },
       { status: 401 }
