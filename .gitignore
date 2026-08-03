@@ -43,3 +43,8 @@ next-env.d.ts
 
 /app/generated/prisma
 .gstack/
+
+# agent skills installés par les intégrations Vercel Marketplace (local uniquement)
+.agents/
+.claude/
+skills-lock.json
