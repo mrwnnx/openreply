@@ -41,6 +41,11 @@ import {
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 
+// Re-sending the reveal on every tap is deliberate, but each send costs a slot
+// against the account's hourly Meta budget, so it needs a ceiling per person.
+const REVEAL_TAP_WINDOW_SECONDS = 3600;
+const REVEAL_TAP_MAX_PER_WINDOW = 5;
+
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
     return `Meta API Error ${error.code}: ${error.message}`;
@@ -708,7 +713,25 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   }
 
   // Duplicate sends are enabled: every button tap re-sends the reveal
-  // instead of only firing once per person.
+  // instead of only firing once per person. Capped per person per hour so a
+  // single recipient tapping in a loop cannot drain the account's 750/h Meta
+  // budget and stall every other campaign. Not applied to the read-receipt
+  // fallback, which is already one-shot per person via the SENT check below.
+  if (!fallback) {
+    try {
+      const redis = getRedisConnection();
+      const tapKey = `reveal:taps:${automation.id}:${userId}`;
+      const taps = await redis.incr(tapKey);
+      if (taps === 1) {
+        await redis.expire(tapKey, REVEAL_TAP_WINDOW_SECONDS);
+      }
+      if (taps > REVEAL_TAP_MAX_PER_WINDOW) return;
+    } catch {
+      // Redis unreachable: deliver rather than drop a legitimate tap. In
+      // practice the queue itself is Redis, so this is barely reachable.
+    }
+  }
+
   const dedupeId = `reveal:${userId}`;
 
   if (fallback) {
