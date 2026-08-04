@@ -15,6 +15,25 @@ import {
 // immediately), so never cache it at the route or CDN layer.
 export const dynamic = "force-dynamic";
 
+// z.string().url() accepts anything new URL() parses, including javascript:,
+// data:, ftp: and file:. These URLs end up as the target of a 302 from our own
+// domain, so the scheme has to be pinned. No domain allowlist: the tracked
+// link is a link shortener by design.
+const httpUrl = z
+  .string()
+  .url()
+  .refine(
+    (value) => {
+      try {
+        const { protocol } = new URL(value);
+        return protocol === "http:" || protocol === "https:";
+      } catch {
+        return false;
+      }
+    },
+    { message: "Only http(s) URLs are allowed" }
+  );
+
 const createAutomationSchema = z
   .object({
     name: z.string().min(1).max(100),
@@ -49,12 +68,12 @@ const createAutomationSchema = z
       .default([]),
     // Empty string means "no tracked link"; a URL sets one.
     trackedDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
+      .union([httpUrl, z.literal("")])
       .optional()
       .nullable(),
     // Optional second tracked link, rendered as a second DM button.
     secondaryDestinationUrl: z
-      .union([z.string().url(), z.literal("")])
+      .union([httpUrl, z.literal("")])
       .optional()
       .nullable(),
     secondaryButtonLabel: z.string().max(20).optional().nullable(),
@@ -110,12 +129,12 @@ const updateAutomationSchema = z.object({
   // Empty string clears the tracked link; a URL updates/creates it; undefined
   // leaves it unchanged.
   trackedDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
+    .union([httpUrl, z.literal("")])
     .optional()
     .nullable(),
   // Same semantics for the optional second tracked link / DM button.
   secondaryDestinationUrl: z
-    .union([z.string().url(), z.literal("")])
+    .union([httpUrl, z.literal("")])
     .optional()
     .nullable(),
   secondaryButtonLabel: z.string().max(20).optional().nullable(),

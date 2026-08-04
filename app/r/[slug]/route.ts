@@ -6,6 +6,21 @@ type RedirectRouteProps = {
   params: Promise<{ slug: string }>;
 };
 
+/**
+ * Rows written before the schema pinned the scheme can still hold anything
+ * new URL() parses, so the destination is re-checked at redirect time rather
+ * than trusted from the database.
+ */
+function toSafeDestination(destinationUrl: string): string | null {
+  try {
+    const url = new URL(destinationUrl);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return null;
+    return url.toString();
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(request: NextRequest, { params }: RedirectRouteProps) {
   const { slug } = await params;
   const trackedLink = await prisma.trackedLink.findUnique({
@@ -27,6 +42,13 @@ export async function GET(request: NextRequest, { params }: RedirectRouteProps) 
     return NextResponse.redirect(new URL("/", request.url), { status: 302 });
   }
 
+  const destination = toSafeDestination(trackedLink.destinationUrl);
+  if (!destination) {
+    // Treated exactly like an unknown slug: no click recorded for a link that
+    // was never going to open.
+    return NextResponse.redirect(new URL("/", request.url), { status: 302 });
+  }
+
   await prisma.linkClick.create({
     data: {
       workspaceId: trackedLink.workspaceId,
@@ -39,5 +61,5 @@ export async function GET(request: NextRequest, { params }: RedirectRouteProps) 
     },
   });
 
-  return NextResponse.redirect(trackedLink.destinationUrl, { status: 302 });
+  return NextResponse.redirect(destination, { status: 302 });
 }
