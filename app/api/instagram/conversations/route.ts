@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { z } from "zod";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { getWorkspaceInstagramAccount } from "@/lib/instagram-accounts";
 import {
@@ -7,6 +8,18 @@ import {
   MetaApiError,
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
+import { reserveDMSlot } from "@/lib/utils/rate-limiter";
+
+const sendMessageSchema = z.object({
+  // No min(1): the inbox seeds this from sessionStorage and sends "" until the
+  // account list resolves. getWorkspaceInstagramAccount already reads ""/"all"
+  // /null alike as "the workspace's most recent account".
+  instagramAccountId: z.string().optional().nullable(),
+  recipientId: z.string().min(1).max(64),
+  // Bounded before trimming so an oversized payload is rejected outright; the
+  // trim preserves the previous "whitespace only is not a message" behaviour.
+  text: z.string().max(1000).trim().min(1),
+});
 
 export interface ConversationListItem {
   id: string;
@@ -103,9 +116,9 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  let body: { instagramAccountId?: string; recipientId?: string; text?: string };
+  let rawBody: unknown;
   try {
-    body = await request.json();
+    rawBody = await request.json();
   } catch {
     return NextResponse.json(
       { success: false, error: "Invalid request body" },
@@ -113,17 +126,19 @@ export async function POST(request: NextRequest) {
     );
   }
 
-  const text = body.text?.trim();
-  if (!body.recipientId || !text) {
+  const parsed = sendMessageSchema.safeParse(rawBody);
+  if (!parsed.success) {
     return NextResponse.json(
       { success: false, error: "A recipient and message are required." },
       { status: 400 }
     );
   }
 
+  const { recipientId, text } = parsed.data;
+
   const account = await getWorkspaceInstagramAccount(
     workspaceId,
-    body.instagramAccountId ?? null
+    parsed.data.instagramAccountId ?? null
   );
   if (!account) {
     return NextResponse.json(
@@ -132,12 +147,29 @@ export async function POST(request: NextRequest) {
     );
   }
 
+  // The inbox used to send outside the rate limiter entirely, so the Redis
+  // counter that keeps the account under Meta's 750 private replies per hour
+  // never saw these sends. With the monthly quota effectively disabled, that
+  // counter is the only thing standing between a loop here and Meta
+  // restricting the account.
+  const slot = await reserveDMSlot(account.instagramId);
+  if (!slot.allowed) {
+    return NextResponse.json(
+      {
+        success: false,
+        error:
+          "Hourly Instagram message limit reached for this account. Try again later.",
+      },
+      { status: 429 }
+    );
+  }
+
   try {
     const accessToken = decryptToken(account.accessToken);
     const result = await sendDirectMessage(
       accessToken,
       account.instagramId,
-      body.recipientId,
+      recipientId,
       text
     );
     return NextResponse.json({ success: true, data: result });
