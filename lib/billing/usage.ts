@@ -1,12 +1,29 @@
 import { prisma } from "@/lib/db/client";
 import type { Prisma } from "@/app/generated/prisma/client";
 
-// Self-hosted build: usage is still counted per month so the dashboard can
-// report volume, but no cap is enforced. Meta's own rate limits apply instead.
+// Monthly DM ceiling per workspace, from MONTHLY_DM_LIMIT.
+//
+// This used to be pinned at two billion, which counted usage for the dashboard
+// but enforced nothing — leaving Meta's own limits as the only brake, i.e. the
+// account getting restricted was the feedback mechanism. The default below is a
+// deliberate backstop, not a billing tier.
+//
 // Must stay within PostgreSQL int4 range, since dmsSentThisPeriod is an Int
-// column and this value is used in a `less-than` comparison against it. Two
-// billion DMs/month is effectively unlimited without overflowing the column.
-const MONTHLY_DM_LIMIT = 2_000_000_000;
+// column and this value is used in a `less-than` comparison against it.
+const DEFAULT_MONTHLY_DM_LIMIT = 10_000;
+const MAX_MONTHLY_DM_LIMIT = 2_000_000_000;
+
+function getMonthlyDMLimit(): number {
+  const raw = process.env.MONTHLY_DM_LIMIT;
+  if (!raw) return DEFAULT_MONTHLY_DM_LIMIT;
+
+  // A malformed value falls back to the default rather than to zero, which
+  // would silently stop every campaign.
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return DEFAULT_MONTHLY_DM_LIMIT;
+
+  return Math.min(parsed, MAX_MONTHLY_DM_LIMIT);
+}
 
 function getMonthStart(date = new Date()): Date {
   return new Date(date.getFullYear(), date.getMonth(), 1);
@@ -70,7 +87,7 @@ export async function reserveWorkspaceDMSend(
       };
     }
 
-    const limit = MONTHLY_DM_LIMIT;
+    const limit = getMonthlyDMLimit();
 
     if (workspace.dmsSentThisPeriod >= limit) {
       return {
@@ -136,7 +153,7 @@ export async function canSendDMForWorkspace(workspaceId: string): Promise<{
     return { allowed: false, remaining: 0, limit: 0 };
   }
 
-  const limit = MONTHLY_DM_LIMIT;
+  const limit = getMonthlyDMLimit();
   const remaining = Math.max(0, limit - workspace.dmsSentThisPeriod);
 
   return {
