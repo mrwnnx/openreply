@@ -345,6 +345,53 @@ model OperationalEvent {
   @@index([createdAt])
 }
 
+model ScheduledJob {
+  id String @id @default(cuid())
+  // Replaces BullMQ's deterministic jobId: the whole dedup story rides on it.
+  // Same key twice means the same piece of work, so scheduling is idempotent.
+  key       String             @unique
+  kind      ScheduledJobKind
+  payload   Json
+  runAt     DateTime
+  status    ScheduledJobStatus @default(PENDING)
+  attempts  Int                @default(0)
+  // Set when a drain claims the row, cleared when it settles. A claim older
+  // than the lock timeout is considered abandoned and can be re-claimed —
+  // this is what a crashed drain leaves behind.
+  claimedAt DateTime?
+  lastError String?
+  createdAt DateTime           @default(now())
+  updatedAt DateTime           @updatedAt
+
+  @@index([status, runAt])
+}
+
+// A counter that resets on the hour. Two things use it: Meta's documented cap of
+// 750 private replies/hour/account, and the per-person ceiling on reveal
+// re-sends. Both were Redis keys with a TTL before the worker was removed.
+// The key carries the subject — "dm:<instagramId>", "taps:<automation>:<user>".
+model RateWindow {
+  key         String
+  windowStart DateTime
+  count       Int      @default(0)
+
+  @@id([key, windowStart])
+  @@index([windowStart])
+}
+
+enum ScheduledJobKind {
+  COMMENT
+  POSTBACK
+  FOLLOWUP
+  MESSAGE
+}
+
+enum ScheduledJobStatus {
+  PENDING
+  DONE
+  FAILED
+}
+
 enum WorkspaceRole {
   OWNER
   ADMIN

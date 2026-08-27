@@ -6,64 +6,44 @@ If you would rather have an AI assistant drive most of this, skip to [Set it up 
 
 ## How it is built
 
-OpenReply is two processes and two datastores.
+OpenReply is one process and one datastore.
 
-- Web app and API: Next.js. Serves the dashboard, the OAuth callback, and the incoming webhook. Runs well on Vercel.
-- Worker: a long-running Node process (`npm run worker`) that consumes the send queue and runs the polling reconciler. It cannot run on Vercel, because serverless functions are short-lived and a queue consumer has to stay up. Railway, Render, Fly, or any always-on box works.
-- PostgreSQL: campaigns, logs, accounts, sessions.
-- Redis: the BullMQ send queue and the per-account rate limiter.
+- Web app and API: Next.js on Vercel. Serves the dashboard, the OAuth callback, the incoming webhook, and the job drain.
+- PostgreSQL: campaigns, logs, accounts, sessions — and the job queue itself.
 
-The web app and the worker must share the same `DATABASE_URL`, the same `REDIS_URL`, and the same `ENCRYPTION_KEY`. The web app writes an encrypted Instagram token; the worker decrypts it to send. Different keys mean every send fails to decrypt.
+Work is a row in `ScheduledJob`. The webhook writes rows, answers Meta immediately, then drains what it just wrote in Next's `after()`. A GitHub Actions cron calls `/api/cron/drain-jobs` every 30 minutes to fire work that was scheduled for later (follow-ups, the read fallback, rate-limit requeues) and to pick up anything an interrupted invocation left behind.
+
+There used to be an always-on worker with Redis and BullMQ. It was removed after it took production down for three weeks: idle, it cost 9.7x the free Redis quota, and its five-minute database poll stopped Postgres from ever suspending. `docs/incident-2026-08.md` has the numbers.
 
 ## What you need first
 
 - A Facebook account. Meta developer registration is built on it. There is no Instagram-only path.
 - An Instagram Business or Creator account. A personal account cannot be connected. Switch it in the Instagram app under Settings, Account type, if needed.
 - A [Resend](https://resend.com) account for login emails, with a verified sender domain. Login is email magic links only, so without this nobody can sign in.
-- Somewhere to host. The recommended setup, used throughout this guide, is Vercel for the web app and Railway for the worker plus Postgres and Redis. Both have free tiers that are enough to run this for a single account.
+- Somewhere to host. The setup used throughout this guide is Vercel for the app and any managed Postgres (Neon, Supabase, Railway — anything with a connection string). Free tiers are enough to run this for a single account.
+- A GitHub account. The job drain runs as a scheduled GitHub Action, which is free.
 
 ## Hosting and your domain
 
 You do not need to buy a domain. Deploying the web app to Vercel gives you a free public URL like `your-app.vercel.app`, and that URL is what everything else points at: `NEXTAUTH_URL`, the Meta OAuth redirect, and the Meta webhook callback all use it. If you want a custom domain later you can add one, but it is optional and you can launch without it.
 
-Recommended split:
+Do the database first, because Vercel needs its URL.
 
-- Web app: Vercel. You get `your-app.vercel.app` for free on deploy.
-- Worker, Postgres, Redis: Railway.
+### Step 1: Postgres
 
-Do Railway first, because Vercel needs the database URLs from it.
+Any managed Postgres works. Two that have a usable free tier:
 
-### Step 1: Railway (Postgres, Redis, worker)
+- **Neon** — create a project and copy its connection string. Note that a free-tier endpoint suspends after five idle minutes; that is deliberate here and the drain interval is set to let it happen.
+- **Railway** — New Project, then New, then Database, then Add PostgreSQL. Open the service's Variables tab and use `DATABASE_PUBLIC_URL` (`*.proxy.rlwy.net`), not `DATABASE_URL` (`postgres.railway.internal`). Vercel runs outside Railway's private network and an internal host will simply hang.
 
-1. Create a Railway account and a New Project.
-2. In the project, click New, then Database, then Add PostgreSQL.
-3. Click New, then Database, then Add Redis.
-4. Add the worker: click New, then GitHub Repo, and select your fork of this repo. Railway detects the Node app.
-5. Open the worker service's Settings and set the Build Command and Start Command:
-   ```
-   Build Command:  npm run db:generate
-   Start Command:  npm run worker
-   ```
-   The worker only needs the generated Prisma client, not `next build`. Do not leave the build as the default `npm run build`: it runs `next build` needlessly, and any build step that reaches the database (like `prisma migrate deploy`) fails here, because the worker cannot connect to Postgres at build time. Migrations are applied by the web app's `vercel-build` (Step 3) and by the manual `db:migrate` below, never by the worker.
-6. Open the worker service's Variables and add all the environment variables from the [table below](#environment-variables). For the worker, use Railway's internal database and Redis hostnames (they look like `postgres.railway.internal` and `redis.railway.internal`); inside Railway's network they are faster and free of egress. `NEXTAUTH_URL` is your Vercel domain. `ENCRYPTION_KEY` must be the exact same value you will use on Vercel.
-
-Getting the connection URLs. Open the Postgres service, then its Variables or Connect tab. You will see two URLs:
-
-| Variable | Host | Use it for |
-| --- | --- | --- |
-| `DATABASE_URL` | `postgres.railway.internal` | the Railway worker only |
-| `DATABASE_PUBLIC_URL` | `*.proxy.rlwy.net` | Vercel, and running migrations from your machine |
-
-Redis is the same: `REDIS_URL` (internal) for the worker, `REDIS_PUBLIC_URL` (public proxy) for Vercel.
-
-Vercel runs outside Railway's private network, so if you give Vercel an internal `*.railway.internal` URL it will hang and time out. Always give Vercel the public URLs.
+If your provider offers a pooled and a direct URL, set both: `DATABASE_URL` for the pooled one and `DATABASE_URL_UNPOOLED` for the direct one. Migrations take a session-level advisory lock, which a transaction pooler cannot hold — `prisma.config.ts` points the CLI at the unpooled URL for exactly this reason, while the app keeps the pooled one.
 
 ### Step 2: Migrate the production database
 
-Run once from your machine, using the public Postgres URL:
+Run once from your machine, using the direct (unpooled) Postgres URL:
 
 ```bash
-DATABASE_URL="postgresql://...proxy.rlwy.net.../railway" npm run db:migrate
+DATABASE_URL="postgresql://..." npm run db:migrate
 ```
 
 ### Step 3: Vercel (web app, and your domain)
@@ -71,27 +51,40 @@ DATABASE_URL="postgresql://...proxy.rlwy.net.../railway" npm run db:migrate
 1. Create a Vercel account and Add New Project, importing your fork. It auto-detects Next.js.
 2. Under the project's Settings, then Environment Variables, add every variable from the [table below](#environment-variables). Use these values:
    - `NEXTAUTH_URL`: your Vercel domain, for example `https://your-app.vercel.app`. This is the free domain Vercel assigns on deploy.
-   - `DATABASE_URL` and `REDIS_URL`: the public Railway URLs (`DATABASE_PUBLIC_URL` and `REDIS_PUBLIC_URL` from Railway).
-   - `ENCRYPTION_KEY`: the exact same value as on the worker.
+   - `DATABASE_URL`: your Postgres connection string.
+   - `ENCRYPTION_KEY`: generate it once and never change it — it encrypts the stored Instagram tokens, and a different key means every send fails to decrypt.
 3. Deploy. The build runs `prisma generate` before `next build`, so the Prisma client is generated even though it is gitignored.
-4. The daily token-refresh cron is wired up in `vercel.json`.
+4. The daily crons are wired up in `vercel.json`.
 
-Note on crons: Vercel's free plan allows each cron to run at most once per day. The repo's crons are set to daily for that reason. The comment polling reconciler does not use a Vercel cron; it runs inside the Railway worker on its own interval, so the free plan is not a constraint there.
+### Step 3b: Enable the job drain
 
-Optional custom domain: if you want `openreply.yoursite.com` instead of the Vercel URL, add it in Vercel under Domains and make it primary. Then update `NEXTAUTH_URL` and the two Meta URLs (Step 7 and Step 8 below) to the new domain, and update the worker's `NEXTAUTH_URL` too, or tracked links in DMs will point at the old domain.
+The drain is a GitHub Action, not a Vercel Cron, because Vercel's free plan fires a cron at most once a day and delayed work here is measured in minutes.
+
+In your fork, under Settings, then Secrets and variables, then Actions, add two repository secrets:
+
+| Secret | Value |
+| --- | --- |
+| `APP_URL` | your deployed URL, e.g. `https://your-app.vercel.app`, no trailing slash |
+| `CRON_SECRET` | the same value you set on Vercel |
+
+The workflow is `.github/workflows/drain-jobs.yml` and runs every 30 minutes. You can trigger it by hand from the Actions tab to check it works — a healthy run prints a JSON body with the counts.
+
+Do not shorten the interval without checking your database's compute budget. Thirty minutes is chosen so a Neon free-tier endpoint still suspends between runs; a five-minute cron keeps it awake around the clock. If you do change it, change `JOB_DRAIN_INTERVAL_MINUTES` on Vercel to match, or the health check's idea of "overdue" drifts.
+
+Optional custom domain: if you want `openreply.yoursite.com` instead of the Vercel URL, add it in Vercel under Domains and make it primary. Then update `NEXTAUTH_URL`, the `APP_URL` secret, and the two Meta URLs (Step 7 and Step 8 below) to the new domain, or tracked links in DMs will point at the old domain.
 
 ## Environment variables
 
-Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway for hosting.
+Copy `.env.example` to `.env` for local work, or set these in Vercel for hosting.
 
 | Variable | What it is |
 | --- | --- |
 | `NEXTAUTH_URL` | Your public URL. Your Vercel domain in production, your tunnel URL locally. |
 | `NEXTAUTH_SECRET` | Random secret. `openssl rand -base64 32` |
 | `CRON_SECRET` | Random secret protecting the token-refresh cron. |
-| `ENCRYPTION_KEY` | 32-byte hex. `openssl rand -hex 32`. Encrypts Instagram tokens. Identical across web and worker. |
-| `DATABASE_URL` | PostgreSQL connection string. Public Railway URL on Vercel; internal on the worker. |
-| `REDIS_URL` | Redis connection string. Must support blocking commands, so an HTTP-only Redis will not work with BullMQ. |
+| `ENCRYPTION_KEY` | 32-byte hex. `openssl rand -hex 32`. Encrypts Instagram tokens. Never change it once tokens are stored. |
+| `DATABASE_URL` | PostgreSQL connection string. The pooled one if your provider has two. |
+| `DATABASE_URL_UNPOOLED` | Optional. The direct connection, used by the Prisma CLI for migrations — a transaction pooler cannot hold the advisory lock they take. |
 | `RESEND_API_KEY` | Resend key. Login is email magic links only, so without this nobody can sign in. |
 | `EMAIL_FROM` | A sender on a domain you verified in Resend. The placeholder will not deliver. |
 | `META_GRAPH_API_VERSION` | Graph API version, for example `v25.0`. |
@@ -102,13 +95,15 @@ Copy `.env.example` to `.env` for local work, or set these in Vercel and Railway
 
 `ENCRYPTION_KEY` must be exactly 64 hex characters or the app throws on boot.
 
-Optional, for tuning the polling reconciler (defaults are fine to start):
+Optional (defaults are fine to start):
 
 | Variable | Default | What it does |
 | --- | --- | --- |
-| `COMMENT_POLL_INTERVAL_MS` | `300000` | How often the worker sweeps for missed comments (5 min). |
+| `JOB_DRAIN_INTERVAL_MINUTES` | `30` | How often you have scheduled the drain workflow. Only used to judge whether jobs are overdue — it does not change the schedule, which lives in the workflow file. |
 | `COMMENT_POLL_MAX_PER_SWEEP` | `30` | Max new comments each campaign acts on per sweep. Keep it conservative; higher gets closer to Instagram's rate limits. |
 | `COMMENT_POLL_LOOKBACK_HOURS` | `72` | How far back a sweep considers comments. |
+
+The comment sweep runs inside the drain cron, so its frequency is the drain's frequency.
 
 ## The Meta app
 
@@ -209,13 +204,13 @@ Meta's `/me` returns two IDs. The `id` field is app-scoped. The `user_id` field 
 4. From a different Instagram account, comment `TEST` on that post. It must be a different account, because OpenReply ignores your own comments on purpose.
 5. Watch for the DM. If nothing arrives, check the DM Logs page and `/api/health`.
 
-Hit `/api/health` any time. It reports the database, Redis, queue, and worker heartbeat. If `worker.healthy` is false, the worker is not running or cannot reach Redis, and no DM will send even though webhooks are being received.
+Hit `/api/health` any time. Unauthenticated it returns the verdict alone; with `Authorization: Bearer $CRON_SECRET` it also reports the database and the job backlog. A backlog means jobs are due and nothing is running them — check that the drain workflow is enabled in the Actions tab and that its two secrets are set.
 
-If you want to inspect where a comment stopped, the Postgres tables tell you: `WebhookEvent` for delivery, `DmLog` for send status and errors, `OperationalEvent` for worker crashes and the polling reconciler's sweep logs.
+If you want to inspect where a comment stopped, the Postgres tables tell you: `WebhookEvent` for delivery, `ScheduledJob` for the work queued from it, `DmLog` for send status and errors, `OperationalEvent` for jobs that failed for good and the polling reconciler's sweep logs.
 
 ## Local development
 
-You need Postgres and Redis. The included `docker-compose.yml` starts both:
+You need Postgres. The included `docker-compose.yml` starts it:
 
 ```bash
 docker-compose up -d
@@ -223,22 +218,26 @@ npm run db:generate
 npm run db:migrate
 ```
 
-Or install them natively (macOS):
+Or install it natively (macOS):
 
 ```bash
-brew install postgresql@16 redis
+brew install postgresql@16
 brew services start postgresql@16
-brew services start redis
 createdb openreply
 ```
 
 Then set `DATABASE_URL` to match your local user, for example `postgresql://YOUR_USER@localhost:5432/openreply`.
 
-Run the two processes in separate terminals:
+One process:
 
 ```bash
 npm run dev
-npm run worker
+```
+
+Nothing runs delayed jobs locally unless you ask it to. Call the drain by hand when you want follow-ups and read fallbacks to fire:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/drain-jobs
 ```
 
 For Meta to reach your local webhook, run a tunnel and point `NEXTAUTH_URL` and the Meta webhook and redirect URLs at the tunnel:
@@ -264,20 +263,21 @@ or host it for other people to sign up.>
 Work through this in order and stop to ask me whenever you need a value or an
 action only I can do:
 
-1. Local or hosted. Ask me which I want. If hosted, we use Vercel for the web
-   app (its domain becomes my public URL) and Railway for the worker plus
-   Postgres and Redis. If local, we use docker-compose and a tunnel.
+1. Local or hosted. Ask me which I want. If hosted, we use Vercel for the app
+   (its domain becomes my public URL), a managed Postgres, and a scheduled
+   GitHub Action for the job drain. If local, we use docker-compose and a
+   tunnel.
 
-2. Datastores. Help me get a Postgres and a Redis running, then run the Prisma
-   migration against them.
+2. Database. Help me get a Postgres running, then run the Prisma migration
+   against it.
 
 3. Environment. Generate NEXTAUTH_SECRET, CRON_SECRET, ENCRYPTION_KEY, and
    WEBHOOK_VERIFY_TOKEN for me. Ask me for my Resend API key and a verified
    sender address, and for the three Meta secrets once I create the app. Make
-   sure ENCRYPTION_KEY is identical on the web app and the worker.
+   sure ENCRYPTION_KEY is generated once and never changed afterwards.
 
-4. Deploy both processes and confirm /api/health returns ok with the worker
-   healthy.
+4. Deploy, set the APP_URL and CRON_SECRET repository secrets so the drain
+   workflow can run, and confirm /api/health returns ok.
 
 5. Meta app. Walk me through the Meta app section of docs/setup.md one step at a
    time. This is the slow part. Tell me exactly what to click and what to paste,
@@ -292,14 +292,14 @@ Rules for you:
 - Never invent Meta dashboard steps. If a screen does not match the guide, ask
   me to screenshot it.
 - Diagnose failures by querying the Postgres tables directly: WebhookEvent for
-  delivery, DmLog for send status, OperationalEvent for worker errors. This is
-  faster than logs.
+  delivery, ScheduledJob for queued work, DmLog for send status,
+  OperationalEvent for jobs that failed for good. This is faster than logs.
 - Remind me to rotate any secret I paste to you before real use.
 
 Start by reading the docs, then ask me question 1.
 ```
 
-By the end, `/api/health` returns `status: ok` with `worker.healthy: true`, and a comment with your keyword from a second account produces a `SENT` row in the DM logs. If you get there, you are done.
+By the end, `/api/health` returns `status: ok`, and a comment with your keyword from a second account produces a `SENT` row in the DM logs. If you get there, you are done.
 
 ## Letting other people use your instance
 

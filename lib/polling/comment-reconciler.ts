@@ -26,7 +26,7 @@
  */
 
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
+import { scheduleJob } from "@/lib/jobs/scheduler";
 import {
   getRecentMediaComments,
   getUserMedia,
@@ -165,7 +165,6 @@ async function sweepCampaign(
   }
   if (mediaIds.length === 0) return stat;
 
-  const queue = getDMQueue();
 
   for (const mediaId of mediaIds) {
     let comments: InstagramComment[];
@@ -225,19 +224,28 @@ async function sweepCampaign(
       .slice(0, MAX_NEW_PER_SWEEP);
 
     for (const c of fresh) {
-      // No deterministic jobId here: a retained completed/failed job from an
-      // earlier sweep would otherwise be treated as a duplicate and silently
-      // drop this add, so the comment would never be retried. Dedup is handled
-      // above (owner-reply + DmLog guards) and the worker is idempotent
+      // The key is bucketed by hour rather than fixed on the comment. A settled
+      // row blocks its own key, so a fixed key would let one exhausted job
+      // permanently bar a comment from ever being picked up again — the sweep
+      // exists precisely to catch what failed the first time. An hour bucket
+      // gives it another chance each sweep hour without letting a single sweep
+      // enqueue the same comment twice. Dedup proper is handled above
+      // (owner-reply + DmLog guards) and the handler is idempotent
       // (publicReplySentAt / SENT), so re-processing a comment is safe.
-      await queue.add("process-comment", {
-        instagramAccountId: account.instagramId,
-        commentId: c.id,
-        commentText: c.text ?? "",
-        commenterId: c.from!.id,
-        commenterName: c.from?.username,
-        mediaId,
-        source: "POLLING",
+      await scheduleJob({
+        kind: "COMMENT",
+        key: `poll_${account.instagramId}_${c.id}_${new Date()
+          .toISOString()
+          .slice(0, 13)}`,
+        payload: {
+          instagramAccountId: account.instagramId,
+          commentId: c.id,
+          commentText: c.text ?? "",
+          commenterId: c.from!.id,
+          commenterName: c.from?.username,
+          mediaId,
+          source: "POLLING",
+        },
       });
       stat.enqueued += 1;
     }

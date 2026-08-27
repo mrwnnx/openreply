@@ -12,7 +12,8 @@ const {
   mockDecryptToken,
   mockMatchKeywords,
   mockReserveDMSlot,
-  mockQueueAdd,
+  mockScheduleJob,
+  mockClaimWindowSlot,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
 } = vi.hoisted(() => ({
@@ -45,7 +46,9 @@ const {
   mockDecryptToken: vi.fn(),
   mockMatchKeywords: vi.fn(),
   mockReserveDMSlot: vi.fn(),
-  mockQueueAdd: vi.fn(),
+  mockScheduleJob: vi.fn(),
+  // Default: the tap ceiling has room. Individual cases override it.
+  mockClaimWindowSlot: vi.fn().mockResolvedValue(1),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
 }));
@@ -94,6 +97,7 @@ vi.mock("@/lib/utils/keyword-matcher", () => ({
 
 vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
+  claimWindowSlot: mockClaimWindowSlot,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -101,38 +105,11 @@ vi.mock("@/lib/billing/usage", () => ({
   releaseWorkspaceDMReservation: mockReleaseWorkspaceDMReservation,
 }));
 
-vi.mock("@/lib/ops/worker-health", () => ({
-  recordWorkerAlert: vi.fn(),
+vi.mock("@/lib/jobs/scheduler", () => ({
+  scheduleJob: mockScheduleJob,
 }));
 
-vi.mock("@/lib/queue/client", () => ({
-  getDMQueue: () => ({
-    add: mockQueueAdd,
-  }),
-  getRedisConnection: vi.fn(),
-  POSTBACK_JOB_NAME: "process-postback",
-  FOLLOWUP_JOB_NAME: "process-followup",
-  MESSAGE_JOB_NAME: "process-message",
-}));
-
-vi.mock("bullmq", () => {
-  function MockWorker(_name: string, processor: unknown) {
-    (global as Record<string, unknown>).__dmWorkerProcessor = processor;
-    return {
-      on: vi.fn(),
-      close: vi.fn(),
-    };
-  }
-  return {
-    Worker: MockWorker,
-  };
-});
-
-import {
-  createDMWorker,
-  countTowardsErrorLogBudget,
-  workerErrorLogBudget,
-} from "../lib/queue/dm-worker";
+import { runScheduledJob } from "../lib/jobs/handlers";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -174,19 +151,34 @@ const mockJobData = {
   mediaId: "media_101",
 };
 
+const KIND_BY_JOB_NAME = {
+  "process-postback": "POSTBACK",
+  "process-followup": "FOLLOWUP",
+  "process-message": "MESSAGE",
+  "process-comment": "COMMENT",
+} as const;
+
+// The suite was written against BullMQ jobs. Rather than rewrite 130 cases, it
+// keeps handing the same shape to a shim that dresses it as a scheduled row —
+// including attemptsMade, which the runner reads one higher because the claim
+// counts the run about to happen.
 function getProcessor(): (job: {
   name?: string;
   data: typeof mockJobData | Record<string, unknown>;
   id: string;
   attemptsMade: number;
 }) => Promise<void> {
-  createDMWorker();
-  return (global as Record<string, unknown>).__dmWorkerProcessor as (job: {
-    name?: string;
-    data: typeof mockJobData | Record<string, unknown>;
-    id: string;
-    attemptsMade: number;
-  }) => Promise<void>;
+  return (job) =>
+    runScheduledJob({
+      id: job.id,
+      key: job.id,
+      kind: KIND_BY_JOB_NAME[
+        (job.name ?? "process-comment") as keyof typeof KIND_BY_JOB_NAME
+      ],
+      payload: job.data as never,
+      runAt: new Date(),
+      attempts: job.attemptsMade + 1,
+    });
 }
 
 function createMockJob(data = mockJobData) {
@@ -404,17 +396,21 @@ describe("DM Worker — Full Pipeline", () => {
       usagePeriodStart
     );
     expect(mockSendPrivateReply).not.toHaveBeenCalled();
-    expect(mockQueueAdd).toHaveBeenCalledWith(
-      "process-comment",
+    expect(mockScheduleJob).toHaveBeenCalledWith(
       expect.objectContaining({
-        commentId: "comment_555",
-        requeueAttempt: 1,
-      }),
-      expect.objectContaining({
-        delay: 1800000,
-        jobId: "comment_ig_456_comment_555_retry_1",
+        kind: "COMMENT",
+        key: "comment_ig_456_comment_555_retry_1",
+        payload: expect.objectContaining({
+          commentId: "comment_555",
+          requeueAttempt: 1,
+        }),
       })
     );
+    // The 30-minute requeue delay is what keeps a rate-limited comment out of
+    // the way until the window rolls over; assert the date, not just the shape.
+    const scheduledAt = mockScheduleJob.mock.calls.at(-1)?.[0].runAt as Date;
+    expect(scheduledAt.getTime() - Date.now()).toBeGreaterThan(29 * 60_000);
+    expect(scheduledAt.getTime() - Date.now()).toBeLessThanOrEqual(30 * 60_000);
   });
 
   it("should skip with SKIPPED_RATE_LIMIT after max requeue attempts", async () => {
@@ -1088,53 +1084,5 @@ describe("DM Worker — DM keyword trigger", () => {
         create: expect.objectContaining({ status: "FAILED" }),
       })
     );
-  });
-});
-
-describe("worker error log budget", () => {
-  beforeEach(() => {
-    workerErrorLogBudget.clear();
-    vi.useRealTimers();
-  });
-
-  it("stores one row per window no matter how many errors arrive", () => {
-    // A dead Redis emits one error per refused command. The old handler wrote
-    // 1.25M rows in three days on exactly this pattern.
-    const message = "ERR max requests limit exceeded";
-    const stored = Array.from({ length: 1000 }, () =>
-      countTowardsErrorLogBudget(message)
-    ).filter((suppressed) => suppressed !== null);
-
-    expect(stored).toEqual([0]);
-  });
-
-  it("reports how many were swallowed once the window closes", () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-08-27T10:00:00Z"));
-    const message = "ERR max requests limit exceeded";
-
-    expect(countTowardsErrorLogBudget(message)).toBe(0);
-    for (let i = 0; i < 999; i += 1) {
-      countTowardsErrorLogBudget(message);
-    }
-
-    vi.setSystemTime(new Date("2026-08-27T10:10:01Z"));
-    expect(countTowardsErrorLogBudget(message)).toBe(999);
-
-    vi.useRealTimers();
-  });
-
-  it("keeps distinct messages on their own budgets", () => {
-    expect(countTowardsErrorLogBudget("redis is gone")).toBe(0);
-    expect(countTowardsErrorLogBudget("postgres is gone")).toBe(0);
-    expect(countTowardsErrorLogBudget("redis is gone")).toBeNull();
-  });
-
-  it("caps the map so the fix cannot leak the way the bug did", () => {
-    for (let i = 0; i < 101; i += 1) {
-      countTowardsErrorLogBudget(`error ${i}`);
-    }
-
-    expect(workerErrorLogBudget.size).toBeLessThanOrEqual(100);
   });
 });

@@ -1,36 +1,31 @@
 /**
  * Rate Limiter
  *
- * Redis-based rate limiter for Instagram private replies.
+ * Postgres-based rate limiter for Instagram private replies.
  *
  * The cap matches Meta's documented limit for this exact call: 750 private
  * replies per hour per Instagram professional account, for comments on posts
- * and reels. Exceeding it risks 429s and app-level restrictions, so the worker
+ * and reels. Exceeding it risks 429s and app-level restrictions, so the caller
  * requeues rather than pushing through.
  * https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
  *
  * Note this is a hard ceiling with no headroom. If Meta throttles before the
  * documented limit, or other calls on the same account share the bucket, lower
  * this value.
+ *
+ * This used to live in Redis. It moved to Postgres when the worker and its
+ * Upstash instance were removed: an idle BullMQ worker cost more Redis commands
+ * than the free tier allowed, and the counter was the only other thing keeping
+ * that dependency alive. One row per account per hour costs a single statement
+ * on a database the send already has to touch.
  */
 
-import Redis from "ioredis";
+import { prisma } from "@/lib/db/client";
 
 const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
-
-let redis: Redis | null = null;
-
-function getRedis(): Redis {
-  if (!redis) {
-    redis = new Redis(process.env.REDIS_URL!, {
-      maxRetriesPerRequest: null, // required by BullMQ
-    });
-  }
-  return redis;
-}
 
 export interface RateLimitResult {
   allowed: boolean;
@@ -42,27 +37,48 @@ export interface RateLimitResult {
   reserved: boolean;
 }
 
-const RESERVE_DM_SLOT_SCRIPT = `
-local current = tonumber(redis.call("GET", KEYS[1]) or "0")
-local max = tonumber(ARGV[1])
-local ttl = tonumber(ARGV[2])
+/**
+ * The hour bucket a moment falls into. Truncating to the hour is what makes the
+ * primary key stable across concurrent sends, and what lets old rows be dropped
+ * by windowStart without tracking expiry per row.
+ */
+export function currentWindowStart(now: Date = new Date()): Date {
+  return new Date(
+    Math.floor(now.getTime() / (RATE_LIMIT_WINDOW * 1000)) *
+      RATE_LIMIT_WINDOW *
+      1000
+  );
+}
 
-if current >= max then
-  return {0, current, 0}
-end
+function dmWindowKey(instagramAccountId: string): string {
+  return `dm:${instagramAccountId}`;
+}
 
-local next_count = redis.call("INCR", KEYS[1])
-if next_count == 1 then
-  redis.call("EXPIRE", KEYS[1], ttl)
-end
+/**
+ * Claim one unit against a key's ceiling for the current hour.
+ *
+ * The increment and the ceiling check are a single statement: the conditional
+ * ON CONFLICT returns no row once the window is full, so concurrent callers
+ * cannot all read a below-limit count and then each proceed. Returns the new
+ * count, or null when the window is full.
+ */
+export async function claimWindowSlot(
+  key: string,
+  max: number
+): Promise<number | null> {
+  const windowStart = currentWindowStart();
 
-return {1, next_count, max - next_count}
-`;
+  const rows = await prisma.$queryRaw<Array<{ count: number }>>`
+    INSERT INTO "RateWindow" ("key", "windowStart", "count")
+    VALUES (${key}, ${windowStart}, 1)
+    ON CONFLICT ("key", "windowStart")
+    DO UPDATE SET "count" = "RateWindow"."count" + 1
+    WHERE "RateWindow"."count" < ${max}
+    RETURNING "count"
+  `;
 
-function toScriptNumber(value: unknown): number {
-  if (typeof value === "number") return value;
-  if (typeof value === "string") return Number.parseInt(value, 10);
-  return 0;
+  const count = rows[0]?.count;
+  return count === undefined ? null : Number(count);
 }
 
 function blockedResult(
@@ -95,47 +111,18 @@ function blockedResult(
 /**
  * Check if an Instagram account is within its DM rate limit.
  *
- * Uses a Redis counter with a 1-hour TTL per account.
- * Key pattern: `rate:dm:{instagramAccountId}`
- *
- * @param instagramAccountId - The Instagram account ID to check
- * @param requeueAttempt - How many times this job has been requeued (0 = first attempt)
- * @returns Rate limit result with action recommendations
+ * Read-only: it reports the state without claiming a slot. Two callers can both
+ * pass this check and then both send, which is why the send path uses
+ * reserveDMSlot instead.
  */
 export async function checkRateLimit(
   instagramAccountId: string,
   requeueAttempt: number = 0
 ): Promise<RateLimitResult> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-
-  const currentCount = await client.get(key);
-  const count = currentCount ? parseInt(currentCount, 10) : 0;
+  const count = await getCurrentDMCount(instagramAccountId);
 
   if (count >= RATE_LIMIT_MAX) {
-    // Over the limit
-    if (requeueAttempt >= MAX_REQUEUE_ATTEMPTS) {
-      // Exceeded max requeue attempts — skip this DM
-      return {
-        allowed: false,
-        currentCount: count,
-        remainingDMs: 0,
-        shouldRequeue: false,
-        requeueDelayMs: 0,
-        shouldSkip: true,
-        reserved: false,
-      };
-    }
-
-    return {
-      allowed: false,
-      currentCount: count,
-      remainingDMs: 0,
-      shouldRequeue: true,
-      requeueDelayMs: REQUEUE_DELAY_MS,
-      shouldSkip: false,
-      reserved: false,
-    };
+    return blockedResult(count, requeueAttempt);
   }
 
   return {
@@ -151,36 +138,34 @@ export async function checkRateLimit(
 
 /**
  * Atomically reserve a DM send slot for an Instagram account.
- * This is the worker-safe path; it prevents concurrent jobs from all passing
- * the rate-limit check before any of them increments the Redis counter.
+ *
+ * The increment and the ceiling check happen in one statement: the conditional
+ * ON CONFLICT returns no row when the window is already full, so concurrent
+ * senders cannot all read a below-limit count and then each send.
  */
 export async function reserveDMSlot(
   instagramAccountId: string,
   requeueAttempt: number = 0
 ): Promise<RateLimitResult> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-
-  const result = await client.eval(
-    RESERVE_DM_SLOT_SCRIPT,
-    1,
-    key,
-    RATE_LIMIT_MAX,
-    RATE_LIMIT_WINDOW
+  const reservedCount = await claimWindowSlot(
+    dmWindowKey(instagramAccountId),
+    RATE_LIMIT_MAX
   );
-  const values = Array.isArray(result) ? result : [];
-  const allowedFlag = toScriptNumber(values[0]);
-  const count = toScriptNumber(values[1]);
-  const remaining = toScriptNumber(values[2]);
 
-  if (allowedFlag !== 1) {
-    return blockedResult(count, requeueAttempt);
+  if (reservedCount === null) {
+    // No row came back: the conditional update did not fire, so the window is
+    // full. Read the count separately for the caller's diagnostics.
+    return blockedResult(
+      await getCurrentDMCount(instagramAccountId),
+      requeueAttempt
+    );
   }
 
+  const count = reservedCount;
   return {
     allowed: true,
     currentCount: count,
-    remainingDMs: remaining,
+    remainingDMs: RATE_LIMIT_MAX - count,
     shouldRequeue: false,
     requeueDelayMs: 0,
     shouldSkip: false,
@@ -190,7 +175,7 @@ export async function reserveDMSlot(
 
 /**
  * Backwards-compatible helper for tests and admin scripts.
- * Prefer reserveDMSlot in workers.
+ * Prefer reserveDMSlot in senders.
  */
 export async function incrementDMCounter(
   instagramAccountId: string
@@ -200,15 +185,22 @@ export async function incrementDMCounter(
 }
 
 /**
- * Get the current DM count for an Instagram account.
+ * Get the current DM count for an Instagram account in the live window.
  */
 export async function getCurrentDMCount(
   instagramAccountId: string
 ): Promise<number> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-  const count = await client.get(key);
-  return count ? parseInt(count, 10) : 0;
+  const row = await prisma.rateWindow.findUnique({
+    where: {
+      key_windowStart: {
+        key: dmWindowKey(instagramAccountId),
+        windowStart: currentWindowStart(),
+      },
+    },
+    select: { count: true },
+  });
+
+  return row?.count ?? 0;
 }
 
 /**
@@ -217,9 +209,9 @@ export async function getCurrentDMCount(
 export async function resetRateLimit(
   instagramAccountId: string
 ): Promise<void> {
-  const client = getRedis();
-  const key = `rate:dm:${instagramAccountId}`;
-  await client.del(key);
+  await prisma.rateWindow.deleteMany({
+    where: { key: dmWindowKey(instagramAccountId) },
+  });
 }
 
 // Export constants for use in tests

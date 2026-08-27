@@ -11,45 +11,56 @@ For the step-by-step setup, see [setup.md](setup.md).
 | Framework | Next.js 16 (App Router, Turbopack) + React 19 |
 | Language | TypeScript 5 |
 | ORM / DB | Prisma 7 with the `@prisma/adapter-pg` driver, PostgreSQL |
-| Queue | BullMQ 5 on Redis, via `ioredis` |
+| Jobs | `ScheduledJob` rows in Postgres, drained by an HTTP endpoint |
 | Auth | Auth.js / NextAuth 5 (email magic links) |
 | Email | Resend (login links) |
 | Validation | Zod 4 |
 | Charts | Recharts 3 |
 | Styling | Tailwind CSS 4 |
 | Tests | Vitest 4 |
-| Worker runtime | `tsx` (runs `worker/dm-worker.ts`) |
 | Instagram | Official Meta Graph API (Instagram Login) |
 
-## Runtime — two processes, two datastores
+## Runtime — one process, one datastore
 
 - **Web app + API** (`npm run dev` / `npm start`): Next.js. Serves the dashboard,
-  the OAuth callback, and the incoming webhook. Serverless-friendly; runs on Vercel.
-- **Worker** (`npm run worker`): a long-running Node process. Consumes the send
-  queue, sends the DMs, runs the polling reconciler, and performs the follow-gate
-  `is_user_follow_business` checks. **Must stay always-on**, so it cannot run on
-  Vercel — it needs an always-on host.
-- **PostgreSQL**: campaigns, DM logs, accounts, sessions, tracked links, click events.
-- **Redis**: the BullMQ send queue and the per-account rate limiter. Must speak the
-  native Redis protocol over TCP (an HTTP-only Redis will not work with BullMQ).
+  the OAuth callback, the incoming webhook, and the job drain. Serverless; runs
+  on Vercel.
+- **PostgreSQL**: campaigns, DM logs, accounts, sessions, tracked links, click
+  events — and the scheduled jobs and hourly rate windows that used to live in
+  Redis.
 
-The web app and the worker must share the same `DATABASE_URL`, `REDIS_URL`, and
-`ENCRYPTION_KEY`. The web app stores the encrypted Instagram token; the worker
-decrypts it to send. Different keys mean every send fails to decrypt.
+There is no worker and no queue server. Work is a `ScheduledJob` row: the
+webhook writes one, answers Meta, then drains what it wrote in `after()`. A
+GitHub Actions cron calls `/api/cron/drain-jobs` on an interval to fire delayed
+work (follow-ups, the read fallback, rate-limit requeues) and to pick up
+anything an interrupted invocation left behind.
+
+### Why it stopped being a worker
+
+The worker was always-on, and always-on does not fit a free tier. Idle BullMQ
+cost 112 Redis commands a minute — 4.8M a month against Upstash's 500k — and the
+reconciler's five-minute database poll matched Neon's scale-to-zero threshold
+exactly, so the database never suspended and burned its compute quota too.
+Production was down for three weeks. See `docs/incident-2026-08.md`.
+
+The drain interval is therefore a compute budget, not a preference:
+`JOB_DRAIN_INTERVAL_MINUTES` (default 30) and the schedule in
+`.github/workflows/drain-jobs.yml` must be changed together.
 
 ## Reference free deployment
 
-The zero-cost stack this instance runs on. Alternatives (e.g. Railway for the
-worker + Postgres + Redis) are covered in [setup.md](setup.md).
+The zero-cost stack this instance runs on.
 
 | Piece | Service | Free tier |
 | --- | --- | --- |
 | Web app | Vercel (Hobby) | Free |
-| PostgreSQL | Neon | Free (~0.5 GB) |
-| Redis | Redis Cloud (Essentials) | Free (30 MB, TCP) |
-| Worker (24/7) | Oracle Cloud "Always Free" VM (VM.Standard.E2.1.Micro, Ubuntu 22.04, kept alive with `pm2`) | Free forever |
+| PostgreSQL | Neon | Free |
+| Job cron | GitHub Actions (`drain-jobs.yml`) | Free |
 | Login email | Resend | Free (3k emails/mo) |
 | Instagram API | Meta app with Instagram Login | Free |
+
+Vercel Cron is not used for the drain: the Hobby plan fires a cron once a day,
+which cannot drive work scheduled minutes out.
 
 ## Environment variables
 
@@ -57,6 +68,6 @@ Names only — values live in `.env` (gitignored) or the host's env settings, ne
 in the repo. Full descriptions are in [setup.md](setup.md#environment-variables).
 
 `NEXTAUTH_URL`, `NEXTAUTH_SECRET`, `CRON_SECRET`, `ENCRYPTION_KEY`, `DATABASE_URL`,
-`REDIS_URL`, `RESEND_API_KEY`, `EMAIL_FROM`, `META_GRAPH_API_VERSION`,
-`INSTAGRAM_APP_ID`, `INSTAGRAM_APP_SECRET`, `FACEBOOK_APP_SECRET`,
-`WEBHOOK_VERIFY_TOKEN`.
+`RESEND_API_KEY`, `EMAIL_FROM`, `META_GRAPH_API_VERSION`, `INSTAGRAM_APP_ID`,
+`INSTAGRAM_APP_SECRET`, `FACEBOOK_APP_SECRET`, `WEBHOOK_VERIFY_TOKEN`,
+`JOB_DRAIN_INTERVAL_MINUTES` (optional).

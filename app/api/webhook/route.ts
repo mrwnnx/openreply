@@ -1,6 +1,8 @@
-import { NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse, after } from "next/server";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
+import { scheduleJob } from "@/lib/jobs/scheduler";
+import { drainDueJobs } from "@/lib/jobs/drain";
+import { claimWindowSlot } from "@/lib/utils/rate-limiter";
 import {
   parseCommentEvents,
   parseMessageEvents,
@@ -8,15 +10,18 @@ import {
   parseReadEvents,
   verifyWebhookSignature,
 } from "@/lib/meta/webhook";
-import { MESSAGE_JOB_NAME, POSTBACK_JOB_NAME } from "@/lib/queue/client";
 import { Prisma } from "@/app/generated/prisma/client";
+
+// `after` runs inside the route's budget, and the drain runs inside `after`.
+// Without this the callback inherits the platform default and a burst of
+// comments gets cut off mid-flight; the drain keeps its own deadline below it.
+export const maxDuration = 60;
 
 const OPENING_DM_READ_FALLBACK_DELAY_MS = 5 * 60 * 1000;
 
 // Anyone on the internet can POST here with a bad signature, so the failure
 // audit trail is throttled to one row per window instead of one per request.
-const SIGNATURE_FAILURE_THROTTLE_KEY = "webhook:sigfail:seen";
-const SIGNATURE_FAILURE_THROTTLE_SECONDS = 300;
+const SIGNATURE_FAILURE_THROTTLE_KEY = "webhook:sigfail";
 
 export async function GET(request: NextRequest) {
   const searchParams = request.nextUrl.searchParams;
@@ -46,18 +51,18 @@ export async function POST(request: NextRequest) {
     // curl loop fill the database. The body itself is never persisted — it
     // is unverified attacker input that gets replayed into the diagnostics
     // screen.
+    // The throttle counter used to be a Redis key with a TTL. On Postgres the
+    // guarded upsert is still one statement and the table still cannot grow
+    // past a row an hour — but unlike Redis it is a statement against the
+    // database, so a sustained flood of bad signatures costs compute here where
+    // it used to cost nothing. Acceptable at one cheap statement per request;
+    // revisit if this endpoint ever gets found and hammered.
     let shouldRecord = false;
     try {
       shouldRecord =
-        (await getRedisConnection().set(
-          SIGNATURE_FAILURE_THROTTLE_KEY,
-          "1",
-          "EX",
-          SIGNATURE_FAILURE_THROTTLE_SECONDS,
-          "NX"
-        )) === "OK";
+        (await claimWindowSlot(SIGNATURE_FAILURE_THROTTLE_KEY, 1)) !== null;
     } catch {
-      // Redis unreachable: drop the audit row rather than the 401.
+      // Database unreachable: drop the audit row rather than the 401.
     }
 
     if (shouldRecord) {
@@ -107,7 +112,6 @@ export async function POST(request: NextRequest) {
     const commentEvents = parseCommentEvents(
       payload as Parameters<typeof parseCommentEvents>[0]
     );
-    const queue = getDMQueue();
 
     for (const event of commentEvents) {
       const account = await prisma.instagramAccount.findUnique({
@@ -115,9 +119,10 @@ export async function POST(request: NextRequest) {
         select: { workspaceId: true },
       });
 
-      await queue.add(
-        "process-comment",
-        {
+      await scheduleJob({
+        kind: "COMMENT",
+        key: `comment_${event.instagramAccountId}_${event.commentId}`,
+        payload: {
           instagramAccountId: event.instagramAccountId,
           commentId: event.commentId,
           commentText: event.commentText,
@@ -126,10 +131,7 @@ export async function POST(request: NextRequest) {
           mediaId: event.mediaId,
           source: "WEBHOOK",
         },
-        {
-          jobId: `comment_${event.instagramAccountId}_${event.commentId}`,
-        }
-      );
+      });
 
       if (account) {
         await prisma.webhookEvent.update({
@@ -145,22 +147,21 @@ export async function POST(request: NextRequest) {
     );
 
     for (const event of postbackEvents) {
-      await queue.add(
-        POSTBACK_JOB_NAME,
-        {
+      await scheduleJob({
+        kind: "POSTBACK",
+        // The colon stripping is inherited from BullMQ, which forbade ":" in a
+        // job id. Nothing requires it now, but the keys are load-bearing for
+        // dedup and rewriting them would make every in-flight key a stranger.
+        key: `postback_${event.instagramAccountId}_${event.userId}_${(
+          event.mid ?? event.payload
+        ).replace(/:/g, "_")}`,
+        payload: {
           instagramAccountId: event.instagramAccountId,
           userId: event.userId,
           payload: event.payload,
           mid: event.mid,
         },
-        {
-          // BullMQ forbids ":" in custom job ids, and the payload is
-          // "reveal:<id>", so build with underscores and strip any colons.
-          jobId: `postback_${event.instagramAccountId}_${event.userId}_${(
-            event.mid ?? event.payload
-          ).replace(/:/g, "_")}`,
-        }
-      );
+      });
     }
 
     // Inbound DMs → keyword-triggered autoreply.
@@ -174,24 +175,21 @@ export async function POST(request: NextRequest) {
         select: { workspaceId: true },
       });
 
-      await queue.add(
-        MESSAGE_JOB_NAME,
-        {
+      await scheduleJob({
+        kind: "MESSAGE",
+        // base64url is injective, which is the point: substituting characters
+        // could let two distinct mids collapse onto one key and silently drop
+        // a reply. Kept as-is now that the key is a plain unique column.
+        key: `message_${event.instagramAccountId}_${Buffer.from(
+          event.messageId
+        ).toString("base64url")}`,
+        payload: {
           instagramAccountId: event.instagramAccountId,
           messageId: event.messageId,
           messageText: event.messageText,
           senderId: event.senderId,
         },
-        {
-          // Message ids can contain characters BullMQ rejects in a job id (":"
-          // in particular). base64url encodes into exactly the allowed alphabet
-          // and stays injective — substituting invalid characters would let two
-          // distinct mids collapse onto one job id, silently dropping a reply.
-          jobId: `message_${event.instagramAccountId}_${Buffer.from(
-            event.messageId
-          ).toString("base64url")}`,
-        }
-      );
+      });
 
       if (account) {
         await prisma.webhookEvent.update({
@@ -236,19 +234,17 @@ export async function POST(request: NextRequest) {
         if (scheduledAutomationIds.has(automation.id)) continue;
         scheduledAutomationIds.add(automation.id);
 
-        await queue.add(
-          POSTBACK_JOB_NAME,
-          {
+        await scheduleJob({
+          kind: "POSTBACK",
+          key: `read_fallback_${event.instagramAccountId}_${event.userId}_${automation.id}`,
+          payload: {
             instagramAccountId: event.instagramAccountId,
             userId: event.userId,
             payload: `reveal:${automation.id}`,
             fallback: true,
           },
-          {
-            delay: OPENING_DM_READ_FALLBACK_DELAY_MS,
-            jobId: `read_fallback_${event.instagramAccountId}_${event.userId}_${automation.id}`,
-          }
-        );
+          runAt: new Date(Date.now() + OPENING_DM_READ_FALLBACK_DELAY_MS),
+        });
       }
     }
 
@@ -258,6 +254,21 @@ export async function POST(request: NextRequest) {
         status: "PROCESSED",
         processedAt: new Date(),
       },
+    });
+
+    // Meta gets its 200 first — it retries anything slower, and a retry storm
+    // is what turned a Redis outage into a dead webhook subscription. The work
+    // runs after the response, on rows that are already committed: if this
+    // invocation is cut short, the cron picks up whatever is still pending.
+    after(async () => {
+      try {
+        await drainDueJobs();
+      } catch (error) {
+        console.error(
+          "[Webhook] Post-response drain failed:",
+          error instanceof Error ? error.message : "Unknown error"
+        );
+      }
     });
 
     return NextResponse.json({ success: true }, { status: 200 });

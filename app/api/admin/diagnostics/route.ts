@@ -1,8 +1,7 @@
 import { NextResponse } from "next/server";
 import { getCurrentWorkspaceId } from "@/lib/auth";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue } from "@/lib/queue/client";
-import { getWorkerAlerts, getWorkerHealth } from "@/lib/ops/worker-health";
+import { DRAIN_INTERVAL_MS } from "@/lib/jobs/config";
 
 export const runtime = "nodejs";
 
@@ -16,17 +15,37 @@ export async function GET() {
   }
 
   const [
-    queueCounts,
-    workerHealth,
-    workerAlerts,
+    jobCounts,
+    overdueJobs,
+    recentJobFailures,
     webhookFailures,
     dmFailures,
     tokenRefreshFailures,
     operationalEvents,
   ] = await Promise.all([
-    getDMQueue().getJobCounts("waiting", "active", "delayed", "failed"),
-    getWorkerHealth(),
-    getWorkerAlerts(10),
+    prisma.scheduledJob.groupBy({
+      by: ["status"],
+      _count: { _all: true },
+    }),
+    prisma.scheduledJob.count({
+      where: {
+        status: "PENDING",
+        runAt: { lt: new Date(Date.now() - DRAIN_INTERVAL_MS * 3) },
+      },
+    }),
+    prisma.scheduledJob.findMany({
+      where: { status: "FAILED" },
+      orderBy: { updatedAt: "desc" },
+      take: 10,
+      select: {
+        id: true,
+        key: true,
+        kind: true,
+        attempts: true,
+        lastError: true,
+        updatedAt: true,
+      },
+    }),
     prisma.webhookEvent.findMany({
       where: { workspaceId, status: "FAILED" },
       orderBy: { createdAt: "desc" },
@@ -94,9 +113,9 @@ export async function GET() {
   return NextResponse.json({
     success: true,
     data: {
-      queueCounts,
-      workerHealth,
-      workerAlerts,
+      jobCounts,
+      overdueJobs,
+      recentJobFailures,
       webhookFailures,
       dmFailures,
       tokenRefreshFailures,

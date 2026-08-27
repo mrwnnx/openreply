@@ -1,0 +1,35 @@
+name: Drain scheduled jobs
+
+# Runs the job drain that used to be an always-on Railway worker.
+#
+# Thirty minutes is a compute budget, not a preference. Neon suspends a
+# free-tier endpoint after five idle minutes, so anything under that keeps the
+# database awake around the clock — roughly 180 compute-hours a month against a
+# ceiling well below it. That is what took production down on 2026-08-27. At
+# this interval the database is asleep for most of the hour.
+#
+# Changing the schedule here means changing JOB_DRAIN_INTERVAL_MINUTES on Vercel
+# too, or the health check's idea of "overdue" drifts away from reality.
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+jobs:
+  drain:
+    name: Drain
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call the drain endpoint
+        run: |
+          response=$(curl -sS -w '\n%{http_code}' \
+            --max-time 90 \
+            -H "Authorization: Bearer ${{ secrets.CRON_SECRET }}" \
+            "${{ secrets.APP_URL }}/api/cron/drain-jobs")
+          body=$(printf '%s' "$response" | sed '$d')
+          status=$(printf '%s' "$response" | tail -n1)
+          printf '%s\n' "$body"
+          if [ "$status" != "200" ]; then
+            echo "Drain failed with HTTP $status"
+            exit 1
+          fi

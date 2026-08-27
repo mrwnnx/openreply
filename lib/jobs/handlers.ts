@@ -1,16 +1,12 @@
-import { Worker, type Job } from "bullmq";
 import {
-  getDMQueue,
-  getRedisConnection,
-  MESSAGE_JOB_NAME,
-  POSTBACK_JOB_NAME,
-  FOLLOWUP_JOB_NAME,
   type DmQueueJob,
+  type JobContext,
   type ProcessCommentJob,
   type ProcessMessageJob,
   type ProcessPostbackJob,
   type ProcessFollowUpJob,
-} from "./client";
+} from "./types";
+import { scheduleJob, type JobKind, type ScheduledJobRow } from "./scheduler";
 import { prisma } from "@/lib/db/client";
 import {
   MetaApiError,
@@ -27,53 +23,21 @@ import {
 } from "@/lib/meta/client";
 import { decryptToken } from "@/lib/meta/oauth";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
-import { reserveDMSlot } from "@/lib/utils/rate-limiter";
+import { claimWindowSlot, reserveDMSlot } from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
 } from "@/lib/billing/usage";
-import { recordWorkerAlert } from "@/lib/ops/worker-health";
 import {
   buildTrackedUrl,
   renderMessageWithTracking,
   renderMessageWithoutLink,
 } from "@/lib/tracking/message";
 
-const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
-
 // Re-sending the reveal on every tap is deliberate, but each send costs a slot
 // against the account's hourly Meta budget, so it needs a ceiling per person.
-const REVEAL_TAP_WINDOW_SECONDS = 3600;
+// The window is the shared hourly bucket in RateWindow.
 const REVEAL_TAP_MAX_PER_WINDOW = 5;
-
-// A Redis outage makes ioredis emit one `error` per refused command, and this
-// handler used to insert a row for each: 1,251,002 rows / 448MB in three days,
-// which filled the database and then burned its compute quota. One row per
-// distinct message per window is enough to diagnose; the rest are counted, not
-// stored.
-const WORKER_ERROR_LOG_WINDOW_MS = 10 * 60_000;
-export const workerErrorLogBudget = new Map<
-  string,
-  { loggedAt: number; suppressed: number }
->();
-
-// Returns how many occurrences were swallowed since the last stored row, or
-// null when this one falls inside the window and must not be stored at all.
-export function countTowardsErrorLogBudget(message: string): number | null {
-  const now = Date.now();
-  const seen = workerErrorLogBudget.get(message);
-  if (seen && now - seen.loggedAt < WORKER_ERROR_LOG_WINDOW_MS) {
-    seen.suppressed += 1;
-    return null;
-  }
-  // The keys are transport-level messages, so a handful in practice — but the
-  // bug being fixed here was an unbounded write, so the map gets a ceiling too.
-  if (workerErrorLogBudget.size >= 100) {
-    workerErrorLogBudget.clear();
-  }
-  workerErrorLogBudget.set(message, { loggedAt: now, suppressed: 0 });
-  return seen?.suppressed ?? 0;
-}
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
@@ -222,7 +186,7 @@ async function sendRevealDirectMessage(
   }
 }
 
-async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
+async function processComment(job: JobContext<ProcessCommentJob>): Promise<void> {
   const {
     instagramAccountId,
     commentId,
@@ -540,17 +504,15 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           },
         });
 
-        await getDMQueue().add(
-          "process-comment",
-          {
+        await scheduleJob({
+          kind: "COMMENT",
+          key: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
+          payload: {
             ...job.data,
             requeueAttempt: requeueAttempt + 1,
           },
-          {
-            delay: rateLimit.requeueDelayMs,
-            jobId: `comment_${instagramAccountId}_${commentId}_retry_${requeueAttempt + 1}`,
-          }
-        );
+          runAt: new Date(Date.now() + rateLimit.requeueDelayMs),
+        });
         continue;
       }
     }
@@ -712,7 +674,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
  * The postback payload is `reveal:<automationId>`; the sender is the user's
  * IGSID (same id as their comment author id), which we DM directly.
  */
-async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
+async function processPostback(job: JobContext<ProcessPostbackJob>): Promise<void> {
   const { instagramAccountId, userId, payload, fallback } = job.data;
 
   const isFollowCheck = payload.startsWith("followcheck:");
@@ -747,18 +709,11 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
   // budget and stall every other campaign. Not applied to the read-receipt
   // fallback, which is already one-shot per person via the SENT check below.
   if (!fallback) {
-    try {
-      const redis = getRedisConnection();
-      const tapKey = `reveal:taps:${automation.id}:${userId}`;
-      const taps = await redis.incr(tapKey);
-      if (taps === 1) {
-        await redis.expire(tapKey, REVEAL_TAP_WINDOW_SECONDS);
-      }
-      if (taps > REVEAL_TAP_MAX_PER_WINDOW) return;
-    } catch {
-      // Redis unreachable: deliver rather than drop a legitimate tap. In
-      // practice the queue itself is Redis, so this is barely reachable.
-    }
+    const claimed = await claimWindowSlot(
+      `taps:${automation.id}:${userId}`,
+      REVEAL_TAP_MAX_PER_WINDOW
+    );
+    if (claimed === null) return;
   }
 
   const dedupeId = `reveal:${userId}`;
@@ -861,19 +816,17 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
       const delayMs =
         Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000;
-      await getDMQueue().add(
-        FOLLOWUP_JOB_NAME,
-        {
+      await scheduleJob({
+        kind: "FOLLOWUP",
+        key: `followup_${automation.id}_${userId}`,
+        payload: {
           instagramAccountId: automation.instagramAccount.instagramId,
           userId,
           automationId: automation.id,
           commenterName,
         },
-        {
-          delay: delayMs,
-          jobId: `followup_${automation.id}_${userId}`,
-        }
-      );
+        runAt: new Date(Date.now() + delayMs),
+      });
     }
     await prisma.dmLog.upsert({
       where: {
@@ -936,7 +889,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
  * Best-effort: if the message can't be delivered (e.g. the 24-hour messaging
  * window closed because the delay was long), it is logged, not retried forever.
  */
-async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
+async function processFollowUp(job: JobContext<ProcessFollowUpJob>): Promise<void> {
   const { instagramAccountId, userId, automationId, commenterName } = job.data;
 
   const automation = await prisma.automation.findFirst({
@@ -987,7 +940,7 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
  * comments) and delivers the reveal directly, honouring the follow gate.
  * Dedup is per inbound message id, so each message triggers at most one reply.
  */
-async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
+async function processMessage(job: JobContext<ProcessMessageJob>): Promise<void> {
   const { instagramAccountId, messageId, messageText, senderId } = job.data;
 
   const automations = await prisma.automation.findMany({
@@ -1165,19 +1118,20 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
         // here exactly as it does after a button tap. Not scheduled behind the
         // follow prompt — no link went out yet in that branch.
         if (automation.followUpEnabled && automation.followUpMessage?.trim()) {
-          await getDMQueue().add(
-            FOLLOWUP_JOB_NAME,
-            {
+          await scheduleJob({
+            kind: "FOLLOWUP",
+            key: `followup_${automation.id}_${senderId}`,
+            payload: {
               instagramAccountId: automation.instagramAccount.instagramId,
               userId: senderId,
               automationId: automation.id,
               commenterName,
             },
-            {
-              delay: Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000,
-              jobId: `followup_${automation.id}_${senderId}`,
-            }
-          );
+            runAt: new Date(
+              Date.now() +
+                Math.max(0, automation.followUpDelayMinutes ?? 0) * 60_000
+            ),
+          });
         }
       }
 
@@ -1230,27 +1184,50 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
   }
 }
 
-async function processJob(job: Job<DmQueueJob>): Promise<void> {
-  if (job.name === POSTBACK_JOB_NAME) {
-    return processPostback(job as Job<ProcessPostbackJob>);
+/**
+ * Run one claimed job.
+ *
+ * Throws on failure — the drain owns what a failure means (retry with backoff,
+ * or give up), so this stays a pure "do the work" call.
+ */
+export async function runScheduledJob(job: ScheduledJobRow): Promise<void> {
+  const context = {
+    data: job.payload as unknown as DmQueueJob,
+    // The claim increments attempts before the run, so `attempts` counts this
+    // run too. The handlers inherited BullMQ's meaning — attempts made BEFORE
+    // this one — and write `attemptsMade + 1` into DmLog. Subtracting here
+    // keeps that column honest instead of starting every log at 2.
+    attemptsMade: Math.max(0, job.attempts - 1),
+  };
+
+  switch (job.kind) {
+    case "POSTBACK":
+      return processPostback(context as JobContext<ProcessPostbackJob>);
+    case "FOLLOWUP":
+      return processFollowUp(context as JobContext<ProcessFollowUpJob>);
+    case "MESSAGE":
+      return processMessage(context as JobContext<ProcessMessageJob>);
+    case "COMMENT":
+      return processComment(context as JobContext<ProcessCommentJob>);
   }
-  if (job.name === FOLLOWUP_JOB_NAME) {
-    return processFollowUp(job as Job<ProcessFollowUpJob>);
-  }
-  if (job.name === MESSAGE_JOB_NAME) {
-    return processMessage(job as Job<ProcessMessageJob>);
-  }
-  return processComment(job as Job<ProcessCommentJob>);
 }
 
-async function recordWorkerFailure(
-  job: Job<DmQueueJob> | undefined,
-  error: Error
-) {
+/**
+ * Leave a trace of a job that failed for good.
+ *
+ * Deliberately narrow: this fires once per job that has exhausted its attempts,
+ * not once per error. The handler it replaces wrote a row per Redis error with
+ * no ceiling and put 1,251,002 of them in the database in three days.
+ */
+export async function recordJobFailure(
+  job: ScheduledJobRow,
+  kind: JobKind,
+  error: string
+): Promise<void> {
   try {
-    const instagramAccountId = job?.data.instagramAccountId;
-    const commentId =
-      job && "commentId" in job.data ? job.data.commentId : null;
+    const data = job.payload as unknown as DmQueueJob;
+    const instagramAccountId = data?.instagramAccountId;
+    const commentId = data && "commentId" in data ? data.commentId : null;
     const account = instagramAccountId
       ? await prisma.instagramAccount.findUnique({
           where: { instagramId: instagramAccountId },
@@ -1263,89 +1240,19 @@ async function recordWorkerFailure(
         workspaceId: account?.workspaceId ?? null,
         source: "WORKER",
         level: "ERROR",
-        message: `DM worker job ${job?.id ?? "unknown"} failed: ${error.message}`,
+        message: `${kind} job ${job.key} failed after ${job.attempts} attempts: ${error}`,
         payload: {
-          jobId: job?.id ?? null,
-          attemptsMade: job?.attemptsMade ?? null,
+          jobKey: job.key,
+          attemptsMade: job.attempts,
           instagramAccountId: instagramAccountId ?? null,
           commentId,
         },
       },
     });
-
-    await recordWorkerAlert({
-      level: "error",
-      message: error.message,
-      jobId: job?.id,
-      instagramAccountId,
-      commentId: commentId ?? undefined,
-    });
   } catch (recordError) {
     console.error(
-      "[DM Worker] Failed to record worker failure:",
+      "[Jobs] Failed to record job failure:",
       formatError(recordError)
     );
   }
 }
-
-export function createDMWorker(): Worker<DmQueueJob> {
-  const worker = new Worker<DmQueueJob>(
-    "dm-processing",
-    processJob,
-    {
-      connection: getRedisConnection(),
-      concurrency: 5,
-      // On BullMQ's defaults (drainDelay 5s, stalledInterval 30s) an idle worker
-      // costs 112 Redis commands a minute — 4.8M a month, 9.7x Upstash's free
-      // ceiling, which it burns through in three days on zero traffic.
-      // drainDelay only bounds the empty blocking read: adding a job wakes the
-      // worker through the marker, so a longer delay does not slow pickup
-      // (measured at 6ms with drainDelay 300). The real cost is recovery — a job
-      // whose worker dies mid-flight waits up to stalledInterval to be retried.
-      drainDelay: 300,
-      stalledInterval: 600_000,
-      settings: {
-        backoffStrategy: (attemptsMade: number) =>
-          BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
-      },
-    }
-  );
-
-  worker.on("completed", (job) => {
-    console.log(`[DM Worker] Job ${job.id} completed`);
-  });
-
-  worker.on("failed", (job, err) => {
-    console.error(
-      `[DM Worker] Job ${job?.id} failed (attempt ${job?.attemptsMade}):`,
-      err.message
-    );
-    void recordWorkerFailure(job, err);
-  });
-
-  worker.on("error", (err) => {
-    console.error("[DM Worker] Worker error:", err.message);
-    const suppressed = countTowardsErrorLogBudget(err.message);
-    if (suppressed === null) {
-      return;
-    }
-    void prisma.operationalEvent
-      .create({
-        data: {
-          source: "WORKER",
-          level: "ERROR",
-          message: `DM worker process error: ${err.message}`,
-          payload: { name: err.name, suppressed },
-        },
-      })
-      .catch((recordError) => {
-        console.error(
-          "[DM Worker] Failed to record worker process error:",
-          formatError(recordError)
-        );
-      });
-  });
-
-  return worker;
-}
-

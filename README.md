@@ -43,14 +43,14 @@ OpenReply is built around Meta's official Instagram private replies. It does not
 1. Someone comments on your Instagram post or reel.
 2. Meta sends a webhook to your OpenReply instance.
 3. OpenReply checks the comment against your active campaigns.
-4. On a keyword match, it queues a job.
-5. A background worker sends the private reply, and the public reply if you enabled one.
+4. On a keyword match, it writes a job row and answers Meta.
+5. The private reply goes out right after the response, along with the public reply if you enabled one.
 
-The web app receives the webhook and serves the dashboard. A separate worker process does the sending, because the send has to survive rate limits and retries. Both talk to the same Postgres and Redis.
+One app, one database. The webhook answers Meta first and does the sending afterwards, so a slow send never turns into a retry storm. Work that has to happen later — follow-ups, the read fallback, a rate-limited retry — waits in the database until a scheduled GitHub Action drains it.
 
 ## Quick start
 
-You need a few free accounts before anything works: a Meta developer app, a Resend account for login emails, and somewhere to host (Vercel for the web app, Railway for the worker plus Postgres and Redis). The Instagram account you connect has to be a Business or Creator account, not a personal one.
+You need a few free accounts before anything works: a Meta developer app, a Resend account for login emails, and somewhere to host (Vercel for the app, plus any managed Postgres). The Instagram account you connect has to be a Business or Creator account, not a personal one.
 
 The honest version: the code deploys in minutes, but the Meta app setup is the part that takes real time. Read [docs/setup.md](docs/setup.md) before you start. It is the single setup guide, covering hosting, your domain, the environment, and every Meta wrong turn so you do not have to find them yourself.
 
@@ -65,13 +65,16 @@ git clone https://github.com/diwenne/openreply.git
 cd openreply
 npm install
 cp .env.example .env      # then fill in the values, see docs/setup.md
-docker-compose up -d      # starts Postgres and Redis
+docker-compose up -d      # starts Postgres
 npm run db:migrate
 npm run dev               # web app on http://localhost:3000
-npm run worker            # in a second terminal, this sends the DMs
 ```
 
-Two processes, always. `npm run dev` serves the app and receives webhooks. `npm run worker` is what actually sends the messages. If comments come in and no DM ever arrives, the worker is the first thing to check.
+One process. Delayed work does not fire on its own locally — call the drain when you want it to:
+
+```bash
+curl -H "Authorization: Bearer $CRON_SECRET" http://localhost:3000/api/cron/drain-jobs
+```
 
 Full environment variables and the production layout are in [docs/setup.md](docs/setup.md).
 
@@ -83,7 +86,7 @@ If you use Claude Code, Cursor, or a similar tool, the Meta setup is a lot faste
 
 - Next.js 16 and React 19 for the web app and API routes
 - Prisma 7 with PostgreSQL
-- BullMQ on Redis for the send queue and the worker
+- Scheduled jobs as Postgres rows, drained after the response and by a GitHub Actions cron
 - Auth.js (NextAuth) with email magic links through Resend
 - Tailwind CSS for the interface
 - The official Instagram API with Instagram Login

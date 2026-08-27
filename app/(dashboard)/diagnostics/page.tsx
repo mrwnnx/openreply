@@ -4,23 +4,15 @@ import { useEffect, useState } from "react";
 import StatusBadge from "@/components/status-badge";
 
 interface DiagnosticsData {
-  queueCounts: Record<string, number>;
-  workerHealth: {
-    healthy: boolean;
-    ageMs: number | null;
-    heartbeat: {
-      checkedAt: string;
-      hostname?: string;
-      pid: number;
-      startedAt?: string;
-    } | null;
-  };
-  workerAlerts: Array<{
-    level: string;
-    message: string;
-    jobId?: string;
-    commentId?: string;
-    createdAt: string;
+  jobCounts: Array<{ status: string; _count: { _all: number } }>;
+  overdueJobs: number;
+  recentJobFailures: Array<{
+    id: string;
+    key: string;
+    kind: string;
+    attempts: number;
+    lastError: string | null;
+    updatedAt: string;
   }>;
   webhookFailures: Array<{
     id: string;
@@ -114,10 +106,9 @@ export default function DiagnosticsPage() {
     return <div className="panel rounded p-8 h-64" />;
   }
 
-  const workerAgeSeconds =
-    data?.workerHealth.ageMs == null
-      ? null
-      : Math.round(data.workerHealth.ageMs / 1000);
+  const jobCountByStatus = new Map(
+    data?.jobCounts.map((row) => [row.status, row._count._all]) ?? []
+  );
 
   return (
     <div className="mx-auto max-w-5xl space-y-6">
@@ -127,7 +118,7 @@ export default function DiagnosticsPage() {
             Production Diagnostics
           </h1>
           <p className="mt-1 text-sm text-muted">
-            Health, queues, webhook failures, billing events, and worker alerts.
+            Health, scheduled jobs, webhook failures, and billing events.
           </p>
         </div>
         <button
@@ -141,58 +132,58 @@ export default function DiagnosticsPage() {
       <div className="grid grid-cols-2 gap-3 sm:gap-4 md:grid-cols-3">
         <div className="panel rounded p-4 sm:p-5">
           <p className="text-xs font-semibold uppercase text-muted">
-            Worker health
+            Drain health
           </p>
           <p
             className={`mt-3 text-2xl font-bold ${
-              data?.workerHealth.healthy ? "text-success" : "text-warning"
+              data && data.overdueJobs === 0 ? "text-success" : "text-warning"
             }`}
           >
-            {data?.workerHealth.healthy ? "Healthy" : "Needs attention"}
+            {data && data.overdueJobs === 0 ? "Healthy" : "Needs attention"}
           </p>
           <p className="mt-2 text-xs text-muted">
-            {workerAgeSeconds == null
-              ? "No heartbeat found"
-              : `Last heartbeat ${workerAgeSeconds}s ago`}
+            {data && data.overdueJobs === 0
+              ? "No jobs running late"
+              : `${data?.overdueJobs ?? 0} job(s) overdue`}
           </p>
         </div>
-        {["waiting", "active", "delayed", "failed"].map((key) => (
-          <div key={key} className="panel rounded p-4 sm:p-5">
+        {["PENDING", "DONE", "FAILED"].map((status) => (
+          <div key={status} className="panel rounded p-4 sm:p-5">
             <p className="text-xs font-semibold uppercase text-muted">
-              Queue {key}
+              Jobs {status.toLowerCase()}
             </p>
             <p className="mt-3 text-2xl font-bold text-foreground">
-              {data?.queueCounts[key] ?? 0}
+              {jobCountByStatus.get(status) ?? 0}
             </p>
           </div>
         ))}
       </div>
 
-      <Section title="Recent Worker Alerts">
-        {data?.workerAlerts.length ? (
+      <Section title="Recent Job Failures">
+        {data?.recentJobFailures.length ? (
           <div className="space-y-3">
-            {data.workerAlerts.map((alert) => (
+            {data.recentJobFailures.map((job) => (
               <div
-                key={`${alert.createdAt}-${alert.jobId ?? alert.message}`}
+                key={job.id}
                 className="rounded border border-border bg-surface/50 p-4"
               >
                 <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-1">
                   <p className="min-w-0 flex-1 break-words text-sm font-semibold text-foreground">
-                    {alert.message}
+                    {job.lastError ?? "Unknown error"}
                   </p>
                   <span className="shrink-0 rounded-full bg-error/10 px-2 py-1 text-xs font-semibold text-error">
-                    {alert.level}
+                    {job.kind}
                   </span>
                 </div>
                 <p className="mt-2 text-xs text-muted">
-                  {formatDate(alert.createdAt)}
-                  {alert.commentId ? ` · ${alert.commentId}` : ""}
+                  {formatDate(job.updatedAt)} · {job.attempts} attempt(s) ·{" "}
+                  {job.key}
                 </p>
               </div>
             ))}
           </div>
         ) : (
-          <EmptyState label="No worker alerts recorded." />
+          <EmptyState label="No failed jobs" />
         )}
       </Section>
 

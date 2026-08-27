@@ -1,12 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/db/client";
-import { getDMQueue, getRedisConnection } from "@/lib/queue/client";
-import { getWorkerHealth } from "@/lib/ops/worker-health";
+import { countOverdueJobs } from "@/lib/jobs/scheduler";
+import { DRAIN_INTERVAL_MS } from "@/lib/jobs/config";
 import { isAuthorizedCron } from "@/lib/cron-auth";
 
 export const runtime = "nodejs";
-// Health must reflect live state (worker heartbeat, queue depth), never a
-// cached response, or it reports stale worker start times.
+// Health must reflect live state (job backlog), never a cached response.
 export const dynamic = "force-dynamic";
 
 type CheckStatus = "ok" | "error";
@@ -15,6 +14,12 @@ interface HealthCheck {
   status: CheckStatus;
   detail?: string;
 }
+
+// Jobs run late by design — the cron only fires every interval. Something is
+// wrong when they are late by several intervals, which is what a cron that has
+// stopped firing looks like. This replaced the worker's Redis heartbeat: it
+// measures the outcome (work is moving) rather than the liveness of a process.
+const BACKLOG_TOLERANCE_MS = DRAIN_INTERVAL_MS * 3;
 
 async function checkDatabase(): Promise<HealthCheck> {
   try {
@@ -31,61 +36,38 @@ async function checkDatabase(): Promise<HealthCheck> {
   }
 }
 
-async function checkRedis(): Promise<HealthCheck> {
+async function checkJobs(): Promise<HealthCheck & { overdue?: number }> {
   try {
-    const pong = await getRedisConnection().ping();
-    return { status: pong === "PONG" ? "ok" : "error", detail: pong };
-  } catch (error) {
-    console.error("[Health] Redis check failed:", error);
+    const overdue = await countOverdueJobs(BACKLOG_TOLERANCE_MS);
     return {
-      status: "error",
-      detail: error instanceof Error ? error.message : "Redis check failed",
+      status: overdue === 0 ? "ok" : "error",
+      overdue,
+      detail:
+        overdue === 0
+          ? undefined
+          : `${overdue} job(s) more than ${Math.round(
+              BACKLOG_TOLERANCE_MS / 60_000
+            )} minutes overdue — is the drain cron firing?`,
     };
-  }
-}
-
-async function checkQueue(): Promise<HealthCheck & { counts?: unknown }> {
-  try {
-    const counts = await getDMQueue().getJobCounts(
-      "waiting",
-      "active",
-      "delayed",
-      "failed"
-    );
-    return { status: "ok", counts };
   } catch (error) {
-    console.error("[Health] Queue check failed:", error);
+    console.error("[Health] Job backlog check failed:", error);
     return {
       status: "error",
-      detail: error instanceof Error ? error.message : "Queue check failed",
+      detail: error instanceof Error ? error.message : "Job check failed",
     };
   }
 }
 
 export async function GET(request: NextRequest) {
   // Two tiers. Unauthenticated callers (uptime probes, Meta, anyone) get the
-  // verdict and nothing else. The infrastructure detail — Neon and Redis error
-  // strings, the worker's hostname and pid, queue depth — needs the cron
-  // secret, because each of those is a free hint for someone mapping the stack.
+  // verdict and nothing else. The infrastructure detail — Neon error strings,
+  // backlog depth — needs the cron secret, because each of those is a free hint
+  // for someone mapping the stack.
   const verbose = isAuthorizedCron(request.headers.get("authorization"));
 
-  const [database, redis, queue, worker] = await Promise.all([
-    checkDatabase(),
-    checkRedis(),
-    checkQueue(),
-    getWorkerHealth().catch((error) => ({
-      healthy: false,
-      heartbeat: null,
-      ageMs: null,
-      error: error instanceof Error ? error.message : "Worker check failed",
-    })),
-  ]);
+  const [database, jobs] = await Promise.all([checkDatabase(), checkJobs()]);
 
-  const healthy =
-    database.status === "ok" &&
-    redis.status === "ok" &&
-    queue.status === "ok" &&
-    worker.healthy;
+  const healthy = database.status === "ok" && jobs.status === "ok";
 
   if (!verbose) {
     return NextResponse.json(
@@ -97,12 +79,7 @@ export async function GET(request: NextRequest) {
   return NextResponse.json(
     {
       status: healthy ? "ok" : "degraded",
-      checks: {
-        database,
-        redis,
-        queue,
-        worker,
-      },
+      checks: { database, jobs },
     },
     { status: healthy ? 200 : 503 }
   );

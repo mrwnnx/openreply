@@ -1,34 +1,32 @@
 /**
  * Rate Limiter — Unit Tests
  *
- * Tests the hourly private-reply cap enforcement using mocked Redis.
- * Assertions derive from RATE_LIMIT_MAX so they survive a change to the cap.
+ * Tests the hourly private-reply cap enforcement against a mocked Prisma
+ * client. Assertions derive from RATE_LIMIT_MAX so they survive a change to
+ * the cap.
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
-const { mockGet, mockEval, mockDel } = vi.hoisted(() => ({
-  mockGet: vi.fn(),
-  mockEval: vi.fn(),
-  mockDel: vi.fn(),
+const { mockQueryRaw, mockFindUnique, mockDeleteMany } = vi.hoisted(() => ({
+  mockQueryRaw: vi.fn(),
+  mockFindUnique: vi.fn(),
+  mockDeleteMany: vi.fn(),
 }));
 
-vi.mock("ioredis", () => {
-  const MockRedis = vi.fn().mockImplementation(function (
-    this: Record<string, unknown>
-  ) {
-    this.get = mockGet;
-    this.eval = mockEval;
-    this.del = mockDel;
-    return this;
-  });
-  return { default: MockRedis };
-});
-
-vi.stubEnv("REDIS_URL", "redis://localhost:6379");
+vi.mock("@/lib/db/client", () => ({
+  prisma: {
+    $queryRaw: mockQueryRaw,
+    rateWindow: {
+      findUnique: mockFindUnique,
+      deleteMany: mockDeleteMany,
+    },
+  },
+}));
 
 import {
   checkRateLimit,
+  currentWindowStart,
   incrementDMCounter,
   reserveDMSlot,
   RATE_LIMIT_MAX,
@@ -38,9 +36,24 @@ beforeEach(() => {
   vi.clearAllMocks();
 });
 
+describe("currentWindowStart", () => {
+  it("truncates to the top of the hour", () => {
+    const start = currentWindowStart(new Date("2026-08-27T14:37:59.999Z"));
+
+    expect(start.toISOString()).toBe("2026-08-27T14:00:00.000Z");
+  });
+
+  it("puts two moments in the same hour in the same window", () => {
+    const a = currentWindowStart(new Date("2026-08-27T14:00:00.000Z"));
+    const b = currentWindowStart(new Date("2026-08-27T14:59:59.000Z"));
+
+    expect(a.getTime()).toBe(b.getTime());
+  });
+});
+
 describe("checkRateLimit", () => {
   it("should allow when count is below limit", async () => {
-    mockGet.mockResolvedValue("50");
+    mockFindUnique.mockResolvedValue({ count: 50 });
 
     const result = await checkRateLimit("account_123");
 
@@ -52,8 +65,8 @@ describe("checkRateLimit", () => {
     expect(result.reserved).toBe(false);
   });
 
-  it("should allow when no previous count exists", async () => {
-    mockGet.mockResolvedValue(null);
+  it("should allow when no window row exists yet", async () => {
+    mockFindUnique.mockResolvedValue(null);
 
     const result = await checkRateLimit("account_123");
 
@@ -62,8 +75,16 @@ describe("checkRateLimit", () => {
     expect(result.remainingDMs).toBe(RATE_LIMIT_MAX);
   });
 
+  it("should not claim a slot — it only reads", async () => {
+    mockFindUnique.mockResolvedValue({ count: 50 });
+
+    await checkRateLimit("account_123");
+
+    expect(mockQueryRaw).not.toHaveBeenCalled();
+  });
+
   it("should deny when count reaches the limit", async () => {
-    mockGet.mockResolvedValue(String(RATE_LIMIT_MAX));
+    mockFindUnique.mockResolvedValue({ count: RATE_LIMIT_MAX });
 
     const result = await checkRateLimit("account_123");
 
@@ -73,7 +94,7 @@ describe("checkRateLimit", () => {
   });
 
   it("should skip after max requeue attempts", async () => {
-    mockGet.mockResolvedValue(String(RATE_LIMIT_MAX));
+    mockFindUnique.mockResolvedValue({ count: RATE_LIMIT_MAX });
 
     const result = await checkRateLimit("account_123", 3);
 
@@ -84,26 +105,22 @@ describe("checkRateLimit", () => {
 });
 
 describe("reserveDMSlot", () => {
-  it("should atomically reserve a slot when below the hourly cap", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+  it("should reserve a slot when below the hourly cap", async () => {
+    mockQueryRaw.mockResolvedValue([{ count: 51 }]);
 
     const result = await reserveDMSlot("account_123");
 
-    expect(mockEval).toHaveBeenCalledWith(
-      expect.any(String),
-      1,
-      "rate:dm:account_123",
-      RATE_LIMIT_MAX,
-      3600
-    );
     expect(result.allowed).toBe(true);
     expect(result.reserved).toBe(true);
     expect(result.currentCount).toBe(51);
-    expect(result.remainingDMs).toBe(139);
+    expect(result.remainingDMs).toBe(RATE_LIMIT_MAX - 51);
   });
 
-  it("should recommend requeue when the atomic reserve is denied", async () => {
-    mockEval.mockResolvedValue([0, RATE_LIMIT_MAX, 0]);
+  it("should recommend requeue when the conditional insert returns nothing", async () => {
+    // An empty result set is how a full window reports itself: the ON CONFLICT
+    // update is guarded by the ceiling, so it simply does not fire.
+    mockQueryRaw.mockResolvedValue([]);
+    mockFindUnique.mockResolvedValue({ count: RATE_LIMIT_MAX });
 
     const result = await reserveDMSlot("account_123", 0);
 
@@ -111,10 +128,12 @@ describe("reserveDMSlot", () => {
     expect(result.reserved).toBe(false);
     expect(result.shouldRequeue).toBe(true);
     expect(result.shouldSkip).toBe(false);
+    expect(result.currentCount).toBe(RATE_LIMIT_MAX);
   });
 
   it("should skip after max requeue attempts", async () => {
-    mockEval.mockResolvedValue(["0", String(RATE_LIMIT_MAX), "0"]);
+    mockQueryRaw.mockResolvedValue([]);
+    mockFindUnique.mockResolvedValue({ count: RATE_LIMIT_MAX });
 
     const result = await reserveDMSlot("account_123", 3);
 
@@ -122,15 +141,25 @@ describe("reserveDMSlot", () => {
     expect(result.shouldRequeue).toBe(false);
     expect(result.shouldSkip).toBe(true);
   });
+
+  it("should treat a count of exactly 1 as the first send of the window", async () => {
+    mockQueryRaw.mockResolvedValue([{ count: 1 }]);
+
+    const result = await reserveDMSlot("account_123");
+
+    expect(result.allowed).toBe(true);
+    expect(result.currentCount).toBe(1);
+    expect(result.remainingDMs).toBe(RATE_LIMIT_MAX - 1);
+  });
 });
 
 describe("incrementDMCounter", () => {
-  it("should use the atomic reservation path", async () => {
-    mockEval.mockResolvedValue([1, 51, 139]);
+  it("should use the reservation path", async () => {
+    mockQueryRaw.mockResolvedValue([{ count: 51 }]);
 
     const count = await incrementDMCounter("account_123");
 
-    expect(mockEval).toHaveBeenCalled();
+    expect(mockQueryRaw).toHaveBeenCalled();
     expect(count).toBe(51);
   });
 });
