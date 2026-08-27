@@ -20,7 +20,18 @@ jobs:
     name: Drain
     runs-on: ubuntu-latest
     steps:
+      - name: Check the secrets are set
+        id: guard
+        run: |
+          if [ -z "${{ secrets.APP_URL }}" ] || [ -z "${{ secrets.CRON_SECRET }}" ]; then
+            echo "APP_URL and CRON_SECRET are not set — see docs/setup.md, Step 3b."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Call the drain endpoint
+        if: steps.guard.outputs.configured == 'true'
         run: |
           response=$(curl -sS -w '\n%{http_code}' \
             --max-time 90 \
