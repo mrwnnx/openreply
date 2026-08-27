@@ -128,7 +128,11 @@ vi.mock("bullmq", () => {
   };
 });
 
-import { createDMWorker } from "../lib/queue/dm-worker";
+import {
+  createDMWorker,
+  countTowardsErrorLogBudget,
+  workerErrorLogBudget,
+} from "../lib/queue/dm-worker";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -1084,5 +1088,53 @@ describe("DM Worker — DM keyword trigger", () => {
         create: expect.objectContaining({ status: "FAILED" }),
       })
     );
+  });
+});
+
+describe("worker error log budget", () => {
+  beforeEach(() => {
+    workerErrorLogBudget.clear();
+    vi.useRealTimers();
+  });
+
+  it("stores one row per window no matter how many errors arrive", () => {
+    // A dead Redis emits one error per refused command. The old handler wrote
+    // 1.25M rows in three days on exactly this pattern.
+    const message = "ERR max requests limit exceeded";
+    const stored = Array.from({ length: 1000 }, () =>
+      countTowardsErrorLogBudget(message)
+    ).filter((suppressed) => suppressed !== null);
+
+    expect(stored).toEqual([0]);
+  });
+
+  it("reports how many were swallowed once the window closes", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-08-27T10:00:00Z"));
+    const message = "ERR max requests limit exceeded";
+
+    expect(countTowardsErrorLogBudget(message)).toBe(0);
+    for (let i = 0; i < 999; i += 1) {
+      countTowardsErrorLogBudget(message);
+    }
+
+    vi.setSystemTime(new Date("2026-08-27T10:10:01Z"));
+    expect(countTowardsErrorLogBudget(message)).toBe(999);
+
+    vi.useRealTimers();
+  });
+
+  it("keeps distinct messages on their own budgets", () => {
+    expect(countTowardsErrorLogBudget("redis is gone")).toBe(0);
+    expect(countTowardsErrorLogBudget("postgres is gone")).toBe(0);
+    expect(countTowardsErrorLogBudget("redis is gone")).toBeNull();
+  });
+
+  it("caps the map so the fix cannot leak the way the bug did", () => {
+    for (let i = 0; i < 101; i += 1) {
+      countTowardsErrorLogBudget(`error ${i}`);
+    }
+
+    expect(workerErrorLogBudget.size).toBeLessThanOrEqual(100);
   });
 });

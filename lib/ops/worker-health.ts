@@ -2,7 +2,11 @@ import { getRedisConnection } from "@/lib/queue/client";
 
 const WORKER_HEALTH_KEY = "health:worker:dm";
 const WORKER_ALERTS_KEY = "alerts:worker:dm";
-const WORKER_HEARTBEAT_TTL_SECONDS = 120;
+// The key has to outlive several beats (180s), otherwise it expires between two
+// of them and worker health flaps. The verdict is judged on age instead: two and
+// a half missed beats means the worker is gone.
+const WORKER_HEARTBEAT_TTL_SECONDS = 600;
+const WORKER_HEALTHY_MAX_AGE_MS = 450_000;
 
 export interface WorkerHeartbeat {
   status: "running";
@@ -66,7 +70,7 @@ export async function getWorkerHealth(): Promise<WorkerHealth> {
 
   const ageMs = Date.now() - new Date(heartbeat.checkedAt).getTime();
   return {
-    healthy: ageMs <= WORKER_HEARTBEAT_TTL_SECONDS * 1000,
+    healthy: ageMs <= WORKER_HEALTHY_MAX_AGE_MS,
     heartbeat,
     ageMs,
   };

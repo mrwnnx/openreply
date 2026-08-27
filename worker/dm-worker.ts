@@ -5,11 +5,18 @@ import os from "node:os";
 
 const worker = createDMWorker();
 const startedAt = new Date().toISOString();
-const HEARTBEAT_INTERVAL_MS = 30_000;
+// At 30s this beat alone cost 86,400 Redis commands a month — 17% of Upstash's
+// free ceiling for a signal that does not need to be second-fresh.
+const HEARTBEAT_INTERVAL_MS = 180_000;
 // Polling safety net for comments that webhooks miss. Runs in the worker because
-// it must fire every few minutes and Vercel's free crons only run once a day.
+// Vercel's free crons only run once a day.
+// At the previous 5 minutes it matched Neon's scale-to-zero threshold exactly,
+// so the database never suspended: 0.25 CU around the clock is ~180 CU-hours a
+// month against a 100 CU-hour ceiling, which is what took the database down on
+// 2026-08-27. Thirty minutes lets it sleep between sweeps; the cost is that a
+// comment the webhook drops waits that long instead of five minutes.
 const POLL_INTERVAL_MS = Number(
-  process.env.COMMENT_POLL_INTERVAL_MS ?? 5 * 60_000
+  process.env.COMMENT_POLL_INTERVAL_MS ?? 30 * 60_000
 );
 
 console.log("[DM Worker] Started");

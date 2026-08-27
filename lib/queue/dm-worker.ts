@@ -46,6 +46,35 @@ const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
 const REVEAL_TAP_WINDOW_SECONDS = 3600;
 const REVEAL_TAP_MAX_PER_WINDOW = 5;
 
+// A Redis outage makes ioredis emit one `error` per refused command, and this
+// handler used to insert a row for each: 1,251,002 rows / 448MB in three days,
+// which filled the database and then burned its compute quota. One row per
+// distinct message per window is enough to diagnose; the rest are counted, not
+// stored.
+const WORKER_ERROR_LOG_WINDOW_MS = 10 * 60_000;
+export const workerErrorLogBudget = new Map<
+  string,
+  { loggedAt: number; suppressed: number }
+>();
+
+// Returns how many occurrences were swallowed since the last stored row, or
+// null when this one falls inside the window and must not be stored at all.
+export function countTowardsErrorLogBudget(message: string): number | null {
+  const now = Date.now();
+  const seen = workerErrorLogBudget.get(message);
+  if (seen && now - seen.loggedAt < WORKER_ERROR_LOG_WINDOW_MS) {
+    seen.suppressed += 1;
+    return null;
+  }
+  // The keys are transport-level messages, so a handful in practice — but the
+  // bug being fixed here was an unbounded write, so the map gets a ceiling too.
+  if (workerErrorLogBudget.size >= 100) {
+    workerErrorLogBudget.clear();
+  }
+  workerErrorLogBudget.set(message, { loggedAt: now, suppressed: 0 });
+  return seen?.suppressed ?? 0;
+}
+
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
     return `Meta API Error ${error.code}: ${error.message}`;
@@ -1266,6 +1295,15 @@ export function createDMWorker(): Worker<DmQueueJob> {
     {
       connection: getRedisConnection(),
       concurrency: 5,
+      // On BullMQ's defaults (drainDelay 5s, stalledInterval 30s) an idle worker
+      // costs 112 Redis commands a minute — 4.8M a month, 9.7x Upstash's free
+      // ceiling, which it burns through in three days on zero traffic.
+      // drainDelay only bounds the empty blocking read: adding a job wakes the
+      // worker through the marker, so a longer delay does not slow pickup
+      // (measured at 6ms with drainDelay 300). The real cost is recovery — a job
+      // whose worker dies mid-flight waits up to stalledInterval to be retried.
+      drainDelay: 300,
+      stalledInterval: 600_000,
       settings: {
         backoffStrategy: (attemptsMade: number) =>
           BACKOFF_DELAYS[Math.min(attemptsMade - 1, BACKOFF_DELAYS.length - 1)],
@@ -1287,13 +1325,17 @@ export function createDMWorker(): Worker<DmQueueJob> {
 
   worker.on("error", (err) => {
     console.error("[DM Worker] Worker error:", err.message);
+    const suppressed = countTowardsErrorLogBudget(err.message);
+    if (suppressed === null) {
+      return;
+    }
     void prisma.operationalEvent
       .create({
         data: {
           source: "WORKER",
           level: "ERROR",
           message: `DM worker process error: ${err.message}`,
-          payload: { name: err.name },
+          payload: { name: err.name, suppressed },
         },
       })
       .catch((recordError) => {
