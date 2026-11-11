@@ -424,6 +424,31 @@ async function processComment(job: JobContext<ProcessCommentJob>): Promise<void>
       continue;
     }
 
+    // One DM per person per campaign: someone who comments again after
+    // getting the DM still gets the public reply above, not a second DM.
+    const alreadySentToCommenter = await prisma.dmLog.findFirst({
+      where: {
+        automationId: automation.id,
+        commenterId,
+        status: "SENT",
+        commentId: { not: commentId },
+      },
+      select: { id: true },
+    });
+    if (alreadySentToCommenter) {
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_DEDUP",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: "This person already got this campaign's DM on an earlier comment",
+        },
+      });
+      continue;
+    }
+
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
     if (!usage.allowed) {
       await prisma.dmLog.update({

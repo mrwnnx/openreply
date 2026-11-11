@@ -842,6 +842,31 @@ describe("DM Worker — one private reply per comment", () => {
     );
   });
 
+  it("should not DM the same person twice from one campaign", async () => {
+    mockPrisma.dmLog.findFirst.mockImplementation(
+      async (args: { where?: { status?: string; commenterId?: string } } = {}) =>
+        args.where?.status === "SENT" && args.where?.commenterId === "commenter_999"
+          ? { id: "earlier_log" }
+          : args.where?.status === "SENT"
+            ? null
+            : { commenterName: "commenter_user" }
+    );
+
+    const processor = getProcessor();
+    await processor(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockReserveWorkspaceDMSend).not.toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "SKIPPED_DEDUP",
+          errorMessage: expect.stringContaining("earlier comment"),
+        }),
+      })
+    );
+  });
+
   it("should not fall back to a plain-text private reply when the window is the problem", async () => {
     mockPrisma.automation.findMany.mockResolvedValue([
       {
